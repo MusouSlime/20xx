@@ -1,0 +1,278 @@
+diff --git a/Core/NES/Debugger/NesDebugger.cpp b/Core/NES/Debugger/NesDebugger.cpp
+index d813a78..737f83c 100644
+--- a/Core/NES/Debugger/NesDebugger.cpp
++++ b/Core/NES/Debugger/NesDebugger.cpp
+@@ -537,7 +537,9 @@ void NesDebugger::ProcessInputOverrides(DebugControllerState inputOverrides[8])
+ 	BaseControlManager* controlManager = _console->GetControlManager();
+ 	for(int i = 0; i < 8; i++) {
+ 		shared_ptr<NesController> controller = std::dynamic_pointer_cast<NesController>(controlManager->GetControlDeviceByIndex(i));
+-		if(controller && inputOverrides[i].HasPressedButton()) {
++		/* MMLC mod: apply overrides unconditionally so releasing all buttons
++		 * clears the controller state (HasPressedButton() used to skip that). */
++		if(controller) {
+ 			controller->SetBitValue(NesController::Buttons::A, inputOverrides[i].A);
+ 			controller->SetBitValue(NesController::Buttons::B, inputOverrides[i].B);
+ 			controller->SetBitValue(NesController::Buttons::Select, inputOverrides[i].Select);
+diff --git a/Core/NES/NesDefaultVideoFilter.cpp b/Core/NES/NesDefaultVideoFilter.cpp
+index 2299979..671e357 100644
+--- a/Core/NES/NesDefaultVideoFilter.cpp
++++ b/Core/NES/NesDefaultVideoFilter.cpp
+@@ -81,7 +81,17 @@ void NesDefaultVideoFilter::GenerateFullColorPalette(uint32_t paletteBuffer[512]
+ void NesDefaultVideoFilter::GetFullPalette(uint32_t palette[512], NesConfig& nesCfg, PpuModel model)
+ {
+ 	if(model == PpuModel::Ppu2C02) {
+-		memcpy(palette, nesCfg.UserPalette, sizeof(nesCfg.UserPalette));
++		//MMLC mod: a headless host never populates UserPalette (the GUI does),
++		//so fall back to the built-in 2C02 palette when it is all zero.
++		bool allZero = true;
++		for(int i = 0; i < 64; i++) {
++			if(nesCfg.UserPalette[i]) { allZero = false; break; }
++		}
++		if(allZero) {
++			memcpy(palette, _ppuPaletteArgb[0], sizeof(_ppuPaletteArgb[0]));
++		} else {
++			memcpy(palette, nesCfg.UserPalette, sizeof(nesCfg.UserPalette));
++		}
+ 		if(!nesCfg.IsFullColorPalette) {
+ 			//Generate emphasis palette colors
+ 			GenerateFullColorPalette(palette);
+diff --git a/InteropDLL/EmuApiWrapper.cpp b/InteropDLL/EmuApiWrapper.cpp
+index 171d263..ffb9742 100644
+--- a/InteropDLL/EmuApiWrapper.cpp
++++ b/InteropDLL/EmuApiWrapper.cpp
+@@ -36,6 +36,96 @@
+ #endif
+ 
+ #include "Shared/Video/SoftwareRenderer.h"
++#include "Core/Shared/Interfaces/IRenderingDevice.h"
++#include "Core/Shared/Interfaces/IAudioDevice.h"
++#include "Core/Shared/Audio/SoundMixer.h"
++#include <mutex>
++#include <vector>
++
++/* Headless frame-capture device (MMLC mod): keeps the last rendered frame so a
++ * host process can pull it without a window/renderer. Added by the mmlc-mod
++ * Mesen host build; see tools/mesen_host/. */
++class CaptureRenderer : public IRenderingDevice
++{
++private:
++	std::mutex _lock;
++	std::vector<uint32_t> _buffer;
++	uint32_t _width = 0, _height = 0, _seq = 0;
++public:
++	void UpdateFrame(RenderedFrame& frame) override {
++		std::lock_guard<std::mutex> g(_lock);
++		if(frame.FrameBuffer && frame.Width && frame.Height) {
++			_width = frame.Width; _height = frame.Height;
++			_buffer.resize((size_t)_width * _height);
++			memcpy(_buffer.data(), frame.FrameBuffer, _buffer.size() * sizeof(uint32_t));
++			_seq++;
++		}
++	}
++	void ClearFrame() override {}
++	void Render(RenderSurfaceInfo&, RenderSurfaceInfo&) override {}
++	void Reset() override {}
++	void SetExclusiveFullscreenMode(bool, void*) override {}
++
++	uint32_t* GetBuffer(uint32_t* w, uint32_t* h, uint32_t* seq) {
++		std::lock_guard<std::mutex> g(_lock);
++		*w = _width; *h = _height; *seq = _seq;
++		return _buffer.empty() ? nullptr : _buffer.data();
++	}
++};
++
++/* Headless audio-capture device (MMLC mod): buffers the mixed audio so the
++ * host can pull it and the proxy can play it. */
++class CaptureAudio : public IAudioDevice
++{
++private:
++	std::mutex _lock;
++	std::vector<int16_t> _ring;
++	size_t _readPos = 0, _writePos = 0;
++	uint32_t _sampleRate = 48000;
++	bool _stereo = true;
++public:
++	CaptureAudio() { _ring.resize((size_t)48000 * 2 * 4); /* 4s stereo */ }
++	void PlayBuffer(int16_t *soundBuffer, uint32_t sampleCount, uint32_t sampleRate, bool isStereo) override {
++		std::lock_guard<std::mutex> g(_lock);
++		_sampleRate = sampleRate; _stereo = isStereo;
++		uint32_t n = sampleCount * (isStereo ? 2 : 1);
++		size_t cap = _ring.size();
++		for(uint32_t i = 0; i < n; i++) {
++			_ring[_writePos] = soundBuffer[i];
++			_writePos = (_writePos + 1) % cap;
++			if(_writePos == _readPos) { _readPos = (_readPos + 1) % cap; }
++		}
++	}
++	void Stop() override {}
++	void Pause() override {}
++	void ProcessEndOfFrame() override {}
++	string GetAvailableDevices() override { return ""; }
++	void SetAudioDevice(string) override {}
++	AudioStatistics GetStatistics() override { return {}; }
++
++	void Clear() {
++		std::lock_guard<std::mutex> g(_lock);
++		_readPos = _writePos = 0;
++	}
++
++	uint32_t Read(int16_t *out, uint32_t maxSamples, uint32_t *sampleRate, bool *stereo) {
++		std::lock_guard<std::mutex> g(_lock);
++		*sampleRate = _sampleRate; *stereo = _stereo;
++		size_t cap = _ring.size();
++		uint32_t avail = (uint32_t)((_writePos >= _readPos) ? (_writePos - _readPos) : (cap - _readPos + _writePos));
++		uint32_t n = avail < maxSamples ? avail : maxSamples;
++		for(uint32_t i = 0; i < n; i++) {
++			out[i] = _ring[_readPos];
++			_readPos = (_readPos + 1) % cap;
++		}
++		return n;
++	}
++};
++
++static CaptureRenderer* _captureRenderer = nullptr;
++static bool _captureMode = false;
++static CaptureAudio* _captureAudio = nullptr;
++static bool _captureAudioMode = false;
+ 
+ unique_ptr<IRenderingDevice> _renderer;
+ unique_ptr<IAudioDevice> _soundManager;
+@@ -81,13 +171,17 @@ extern "C" {
+ 	{
+ 		FolderUtilities::SetHomeFolder(homeFolder);
+ 
+-		if(windowHandle != nullptr && viewerHandle != nullptr) {
++		if(_captureMode || (windowHandle != nullptr && viewerHandle != nullptr)) {
+ 			_windowHandle = windowHandle;
+ 			_viewerHandle = viewerHandle;
+ 			_softwareRenderer = softwareRenderer;
+ 
+ 			if(!noVideo) {
+-				if(softwareRenderer) {
++				if(_captureMode) {
++					_captureRenderer = new CaptureRenderer();
++					_renderer.reset(_captureRenderer);
++					_emu->GetVideoRenderer()->RegisterRenderingDevice(_captureRenderer);
++				} else if(softwareRenderer) {
+ 					_renderer.reset(new SoftwareRenderer(_emu.get()));
+ 				} else {
+ 					#ifdef _WIN32
+@@ -100,7 +194,11 @@ extern "C" {
+ 				}
+ 			} 
+ 
+-			if(!noAudio) {
++			if(_captureAudioMode) {
++				/* Headless: capture the mixed audio instead of playing it. */
++				_captureAudio = new CaptureAudio();
++				_emu->GetSoundMixer()->RegisterAudioDevice(_captureAudio);
++			} else if(!noAudio) {
+ 				#ifdef _WIN32
+ 					_soundManager.reset(new SoundManager(_emu.get(), (HWND)_windowHandle));
+ 				#else
+@@ -125,6 +223,105 @@ extern "C" {
+ 		}
+ 	}
+ 
++	/* MMLC mod: enable the headless capture renderer before InitializeEmu, and
++	 * pull the latest frame with GetVideoBuffer (0xAARRGGBB, row-major). */
++	DllExport void __stdcall EnableCaptureRenderer(bool enabled) { _captureMode = enabled; }
++
++	DllExport uint32_t* __stdcall GetVideoBuffer(uint32_t* width, uint32_t* height, uint32_t* seq)
++	{
++		if(!_captureRenderer) {
++			if(width) *width = 0;
++			if(height) *height = 0;
++			if(seq) *seq = 0;
++			return nullptr;
++		}
++		return _captureRenderer->GetBuffer(width, height, seq);
++	}
++
++	/* MMLC mod: headless audio capture (interleaved int16; the proxy plays it). */
++	DllExport void __stdcall EnableCaptureAudio(bool enabled) { _captureAudioMode = enabled; }
++
++	DllExport void __stdcall FlushAudioCapture()
++	{
++		if(_captureAudio) _captureAudio->Clear();
++	}
++
++	DllExport uint32_t __stdcall GetAudioBuffer(int16_t* out, uint32_t maxSamples, uint32_t* sampleRate, uint32_t* stereo)
++	{
++		if(!_captureAudio) { if(sampleRate) *sampleRate = 0; if(stereo) *stereo = 0; return 0; }
++		bool st = true;
++		uint32_t n = _captureAudio->Read(out, maxSamples, sampleRate, &st);
++		if(stereo) *stereo = st ? 1 : 0;
++		return n;
++	}
++
++	/* MMLC mod: ensure standard NES controllers are connected on ports 1/2
++	 * (the headless default config leaves them as "None"). Must be called
++	 * before LoadRom so the control devices are created. */
++	DllExport void __stdcall ConfigureNesInput()
++	{
++		if(!_emu) return;
++		NesConfig cfg = _emu->GetSettings()->GetNesConfig();
++		cfg.Port1.Type = ControllerType::NesController;
++		cfg.Port2.Type = ControllerType::NesController;
++		/* Headless default leaves channel volumes at 0 (the GUI sets them),
++		 * which mutes the APU. Restore them to 100%. */
++		for(int i = 0; i < 11; i++) {
++			cfg.ChannelVolumes[i] = 100;
++			cfg.ChannelPanning[i] = 0;
++		}
++		_emu->GetSettings()->SetNesConfig(cfg);
++	}
++
++	/* MMLC mod: soft-reset the console (used to restart Mesen at the title). */
++	DllExport void __stdcall ResetConsole()
++	{
++		if(_emu) _emu->Reset();
++	}
++
++	/* MMLC mod: set the emulation speed in percent (100 = original, >100 =
++	 * turbo). Maps the MMLC "CPU SPEED" option onto Mesen. */
++	DllExport void __stdcall SetEmulationSpeed(uint32_t percent)
++	{
++		if(!_emu || percent == 0) return;
++		EmulationConfig cfg = _emu->GetSettings()->GetEmulationConfig();
++		cfg.EmulationSpeed = percent;
++		_emu->GetSettings()->SetEmulationConfig(cfg);
++	}
++
++	/* MMLC mod: NES CPU overclock (extra PPU scanlines per frame). Maps the
++	 * MMLC "CPU SPEED: TURBO" option onto Mesen's overclock. */
++	DllExport void __stdcall SetNesOverclock(uint32_t scanlines)
++	{
++		if(!_emu) return;
++		NesConfig cfg = _emu->GetSettings()->GetNesConfig();
++		cfg.PpuExtraScanlinesBeforeNmi = scanlines;
++		cfg.PpuExtraScanlinesAfterNmi = scanlines;
++		_emu->GetSettings()->SetNesConfig(cfg);
++	}
++
++	/* MMLC mod: feed NES controller input (bits follow $4016:
++	 * A=1,B=2,Select=4,Start=8,Up=16,Down=32,Left=64,Right=128).
++	 * Stored as debugger input overrides so they survive the per-frame input
++	 * refresh (they are applied on the InputPolled event). */
++	DllExport void __stdcall SetControllerState(uint32_t port, uint32_t buttons)
++	{
++		if(!_emu) return;
++		DebuggerRequest req = _emu->GetDebugger(true);
++		Debugger* dbg = req.GetDebugger();
++		if(!dbg) return;
++		DebugControllerState s = {};
++		s.A = (buttons & 1) != 0;
++		s.B = (buttons & 2) != 0;
++		s.Select = (buttons & 4) != 0;
++		s.Start = (buttons & 8) != 0;
++		s.Up = (buttons & 16) != 0;
++		s.Down = (buttons & 32) != 0;
++		s.Left = (buttons & 64) != 0;
++		s.Right = (buttons & 128) != 0;
++		dbg->SetInputOverrides(port, s);
++	}
++
+ 	DllExport void __stdcall SetExclusiveFullscreenMode(bool fullscreen, void *windowHandle)
+ 	{
+ 		if(_renderer) {

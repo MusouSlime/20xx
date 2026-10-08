@@ -1,0 +1,9 @@
+# mmlc.tool.ini -- configuration for the mmlc CLI (not the runtime proxy).
+# Copy to mmlc.tool.ini (repo root or CWD) or ~/.config/mmlc/mmlc.ini.
+
+# WinZip AES-256 password for data.pie. Public constant for the Steam build;
+# override only if your install differs.
+pie_password=P091uWEdwe4lI6StDNMNlkodPGvJ38bL3HW6t3BCMYdFi83FXKu7k0NsHP8caDKS
+
+# Optional: path/name of the 7z executable (default: search PATH).
+# sevenz=7z

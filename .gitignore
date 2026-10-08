@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Build artifacts (regenerate with build/build_proxy.sh and cc)
+build/steam_api.dll
+build/mesen_host
+build/*.def
+build/*.log
+*.log
+
+# Local install/backups (never commit game data or ROMs)
+.mmlc-backup/
+roms/
+data.pie
+data.pie.*
+*.bak
+*.ipsadjust
