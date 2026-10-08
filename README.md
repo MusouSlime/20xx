@@ -75,6 +75,7 @@ On Windows, apply the same patch and build `InteropDLL` (x64) from
 
 # launch the GUI wizard (install folder, setup, options, launch)
 20xx gui
+# or double-click the launcher:  ./20xx-gui.sh  (Linux)  20xx-gui.bat  (Windows)
 
 # or drive it from the terminal
 20xx extract                 # write roms/*.nes from your own Proteus.exe
