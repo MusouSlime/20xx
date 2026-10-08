@@ -1491,8 +1491,8 @@ static int g_menu_rb = 0;          /* ini menu_rb: open the MMLC UI with RB */
 static DWORD g_menu_btn = 0x0020;
 
 /* XInput -> NES button mapping, configurable via mmlc.ini (btn_a..btn_right).
- * Defaults match the fixed MMLC layout. */
-static DWORD g_btn_a = 0x1000, g_btn_b = 0x2000, g_btn_select = 0x0200,
+ * Defaults match the collection's layout (NES B = Xbox X). */
+static DWORD g_btn_a = 0x1000, g_btn_b = 0x4000, g_btn_select = 0x0200,
              g_btn_start = 0x0010, g_btn_up = 0x0001, g_btn_down = 0x0002,
              g_btn_left = 0x0004, g_btn_right = 0x0008;
 

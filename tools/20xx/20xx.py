@@ -144,11 +144,11 @@ def extract(game_dir: str, out_dir: str, game: Optional[str] = None,
 RANDO_GAMES = {"mm1"}
 
 
-def random_seed() -> str:
+def random_seed(length: int = 5) -> str:
+    """A short, letter-only seed (default 5 letters)."""
     import random
     import string
-    alphabet = string.ascii_lowercase + string.digits
-    return "".join(random.choice(alphabet) for _ in range(10))
+    return "".join(random.choice(string.ascii_lowercase) for _ in range(length))
 
 
 # --- ROM-hack drop-in folder ------------------------------------------------
@@ -279,12 +279,23 @@ def verify(game_dir: str, source: Optional[str] = None) -> int:
     return 1 if bad else 0
 
 
-def launch(appid: str = DEFAULT_APPID) -> None:
-    print(f"[20xx] steam -applaunch {appid}")
+def launch(appid: str = DEFAULT_APPID, status=print) -> None:
+    try:
+        if subprocess.run(["pgrep", "-x", "Proteus.exe"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          ).returncode == 0:
+            status("[20xx] note: Proteus.exe is already running — close it first, "
+                   "Steam ignores -applaunch while the game is up")
+    except (OSError, ValueError):
+        pass
+    status(f"[20xx] steam -applaunch {appid}")
     try:
         subprocess.Popen(["steam", "-applaunch", appid])
+        status("[20xx] launch requested (collection should open)")
     except FileNotFoundError:
-        print("20xx: 'steam' not found on PATH", file=sys.stderr)
+        status("20xx: 'steam' not found on PATH")
+    except OSError as ex:
+        status(f"20xx: launch failed: {ex}")
 
 
 # --- Mesen replacer option --------------------------------------------------
@@ -764,11 +775,45 @@ def cmd_play(args: argparse.Namespace) -> int:
 
 GUI_MODES = [
     "Vanilla",
+    "ROM hack only",
     "Randomized (fresh seed)",
     "Randomized (custom seed)",
     "Palette shuffle only",
     "Randomized + weakness visualizer",
 ]
+
+
+def open_folder(path: str) -> None:
+    """Open a folder/file in the OS file manager."""
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except OSError as ex:
+        print(f"20xx: could not open {path}: {ex}")
+
+
+# NES button -> XInput button mapping. Names match `parse_button` in the proxy.
+INPUT_CHOICES = ["a", "b", "x", "y", "lb", "rb", "back", "start", "ls", "rs",
+                 "dpad_up", "dpad_down", "dpad_left", "dpad_right", "guide"]
+INPUT_LABELS = {
+    "btn_a": "A", "btn_b": "B", "btn_select": "Select", "btn_start": "Start",
+    "btn_up": "Up", "btn_down": "Down", "btn_left": "Left", "btn_right": "Right",
+}
+# Defaults match the collection's layout (NES B = Xbox X).
+DEFAULT_INPUT_MAP = {
+    "btn_a": "a", "btn_b": "x", "btn_select": "rb", "btn_start": "start",
+    "btn_up": "dpad_up", "btn_down": "dpad_down",
+    "btn_left": "dpad_left", "btn_right": "dpad_right",
+}
+
+
+def write_input_map(game_dir: str, mapping: dict) -> None:
+    """Persist btn_* values into mmlc.ini (the proxy reads them at load)."""
+    ini_set(game_dir, {k: v for k, v in mapping.items() if v})
 
 
 def gui_config_path() -> str:
@@ -864,12 +909,35 @@ def cmd_gui(args: argparse.Namespace) -> int:
     ttk.Button(f2, text="Build core",
                command=lambda: run(build_core_task)).grid(row=0, column=3, padx=4)
 
+    class _QWriter:
+        def __init__(self):
+            self.buf = ""
+
+        def write(self, s):
+            self.buf += s
+            while "\n" in self.buf:
+                line, self.buf = self.buf.split("\n", 1)
+                logq.put(line)
+
+        def flush(self):
+            if self.buf:
+                logq.put(self.buf)
+                self.buf = ""
+
     def run(task):
         def wrapper():
+            w = _QWriter()
+            old = sys.stdout, sys.stderr
+            sys.stdout = sys.stderr = w
             try:
                 task()
             except Exception as ex:
+                import traceback
                 logq.put(f"ERROR: {ex}")
+                logq.put(traceback.format_exc())
+            finally:
+                w.flush()
+                sys.stdout, sys.stderr = old
         threading.Thread(target=wrapper, daemon=True).start()
 
     f3 = ttk.Frame(root)
@@ -885,18 +953,42 @@ def cmd_gui(args: argparse.Namespace) -> int:
     ttk.Label(f4, text="Mode").grid(row=0, column=2, sticky="w", padx=6)
     ttk.Combobox(f4, textvariable=mode, values=GUI_MODES,
                  state="readonly", width=30).grid(row=0, column=3, padx=6)
-    ttk.Label(f4, text="Seed").grid(row=1, column=0, sticky="w", padx=6, pady=4)
-    ttk.Entry(f4, textvariable=seed, width=20).grid(row=1, column=1, sticky="w", padx=6)
+    ttk.Label(f4, text="Seed (5 letters)").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+    vcmd = (root.register(lambda s: len(s) <= 5 and (s == "" or s.isalpha())), "%P")
+    sf = ttk.Frame(f4)
+    sf.grid(row=1, column=1, sticky="w", padx=6)
+    ttk.Entry(sf, textvariable=seed, width=8, validate="key",
+              validatecommand=vcmd).pack(side="left")
+    ttk.Button(sf, text="Random", command=lambda: seed.set(random_seed())).pack(side="left", padx=4)
     ttk.Label(f4, text="ROM hack").grid(row=1, column=2, sticky="w", padx=6)
     hack_cb = ttk.Combobox(f4, textvariable=hack, values=["<none>"],
                            state="readonly", width=30)
     hack_cb.grid(row=1, column=3, padx=6)
 
+    f6 = ttk.LabelFrame(root, text="4. Controls (NES button -> Xbox button)")
+    f6.pack(fill="x", padx=10, pady=6)
+    input_vars: dict = {}
+    saved_map = cfg.get("input_map", DEFAULT_INPUT_MAP)
+    for i, key in enumerate(["btn_a", "btn_b", "btn_select", "btn_start",
+                             "btn_up", "btn_down", "btn_left", "btn_right"]):
+        r, c = divmod(i, 4)
+        ttk.Label(f6, text=INPUT_LABELS[key]).grid(row=r, column=c * 2,
+                                                   sticky="e", padx=4, pady=3)
+        v = tk.StringVar(value=saved_map.get(key, DEFAULT_INPUT_MAP[key]))
+        ttk.Combobox(f6, textvariable=v, values=INPUT_CHOICES, state="readonly",
+                     width=10).grid(row=r, column=c * 2 + 1, sticky="w", padx=4)
+        input_vars[key] = v
+    ttk.Button(f6, text="Save controls", command=lambda: run(save_controls)
+               ).grid(row=2, column=0, columnspan=2, pady=4, sticky="w")
+
     f5 = ttk.Frame(root)
     f5.pack(fill="x", padx=10, pady=4)
     ttk.Button(f5, text="Prepare & Launch", command=lambda: run(launch_task)).pack(side="left")
     ttk.Button(f5, text="Open romhacks folder",
-               command=lambda: run(lambda: logq.put("romhacks: " + ensure_romhacks_dir(game_dir.get())))
+               command=lambda: run(open_romhacks)
+               ).pack(side="left", padx=6)
+    ttk.Button(f5, text="Rescan hacks",
+               command=lambda: (refresh_hacks(), logq.put("[20xx] romhack list refreshed"))
                ).pack(side="left", padx=6)
 
     log = ScrolledText(root, height=15, state="disabled", font=("monospace", 9))
@@ -933,6 +1025,22 @@ def cmd_gui(args: argparse.Namespace) -> int:
                 ini_set(gd, {"mesen": "1", "mesen_core": c})
             logq.put("[20xx] core ready.")
 
+    def open_romhacks():
+        p = ensure_romhacks_dir(game_dir.get())
+        logq.put(f"[20xx] romhacks folder: {p}")
+        open_folder(p)
+
+    def save_controls():
+        m = {k: v.get() for k, v in input_vars.items()}
+        gd = game_dir.get().strip()
+        if gd:
+            write_input_map(gd, m)
+        c = dict(gui_config_load())
+        c.update({"game_dir": gd, "core": core.get().strip(), "input_map": m})
+        gui_config_save(c)
+        logq.put("[20xx] controls saved: "
+                 + ", ".join(f"{k[4:]}={v}" for k, v in m.items()))
+
     def setup_task():
         gd = game_dir.get().strip()
         if not gd:
@@ -951,12 +1059,16 @@ def cmd_gui(args: argparse.Namespace) -> int:
             if not check_core(c):
                 logq.put("WARNING: core is missing MMLC hooks (see mesen2_capture.patch)")
         logq.put(f"[20xx] romhacks folder: {ensure_romhacks_dir(gd)}")
+        write_input_map(gd, {k: v.get() for k, v in input_vars.items()})
         host = ensure_host()
         if host:
             logq.put(f"[20xx] mesen_host: {host}")
         written = extract(gd, os.path.join(gd, "roms"), None, None, quiet=True)
         logq.put(f"[20xx] extracted {len(written)} ROM(s) -> {os.path.join(gd, 'roms')}")
-        gui_config_save({"game_dir": gd, "core": c})
+        c2 = dict(gui_config_load())
+        c2.update({"game_dir": gd, "core": c,
+                   "input_map": {k: v.get() for k, v in input_vars.items()}})
+        gui_config_save(c2)
         logq.put("[20xx] setup complete.")
 
     def verify_task():
@@ -995,10 +1107,22 @@ def cmd_gui(args: argparse.Namespace) -> int:
                 picks = [h for h in found if os.path.basename(h) == hs]
                 if picks:
                     opts["romhacks"] = picks
+        elif m == "ROM hack only":
+            found = discover_romhacks(gd, key)
+            if found:
+                opts["romhacks"] = found
+                hs = "<all>"
+            else:
+                logq.put(f"[20xx] no patches in romhacks/{key}/ — drop .ips/.bps there")
+                return
+        write_input_map(gd, {k: v.get() for k, v in input_vars.items()})
         logq.put(f"[20xx] {key}: {m} seed={opts.get('seed', '-')} hack={hs}")
         prepare_roms(gd, os.path.join(gd, "roms"), **opts)
         logq.put("[20xx] launching collection...")
-        ensure_mesen_host(gd)
+        try:
+            ensure_mesen_host(gd)
+        except Exception as ex:
+            logq.put(f"[20xx] host start failed (continuing): {ex}")
         launch(args.appid)
 
     refresh_hacks()
