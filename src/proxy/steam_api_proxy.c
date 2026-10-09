@@ -677,8 +677,41 @@ static int install_vtable_freeze(void)
     return 0;
 }
 
-/* Watch the MMLC options file so we can map CPU SPEED (ORIGINAL/TURBO) onto
- * Mesen's emulation speed. Logs the raw bytes whenever it changes. */
+/* --- Overclock (tie to MMLC's in-game "CPU SPEED" option) ------------------
+ * MMLC's options store CPU SPEED (ORIGINAL/TURBO) as a float at Options2.sav
+ * +0x28 (locale: "CPU SPEED" / "ORIGINAL" / "TURBO"). We mirror TURBO onto
+ * Mesen's NES overclock (extra PPU scanlines, keeps 60 fps -> less slowdown).
+ * `mesen_overclock` sets an explicit scanline count (disables following);
+ * `mesen_overclock_follow` (default 1) follows the in-game option;
+ * `mesen_overclock_turbo` (default 262) is the scanline count for TURBO. */
+static int g_oc_follow = 1;
+static int g_oc_manual = -1;     /* >=0: explicit scanlines, ignore in-game */
+static int g_oc_turbo = 262;
+static int g_oc_applied = -1;
+
+static void mesen_apply_overclock(float speed)
+{
+    int sl;
+    if (g_oc_manual >= 0)
+        sl = g_oc_manual;
+    else if (!g_oc_follow)
+        return;
+    else
+        sl = (speed > 1.001f) ? g_oc_turbo : 0;
+    if (sl < 0) sl = 0;
+    if (sl > 8192) sl = 8192;
+    if (sl != g_oc_applied) {
+        g_oc_applied = sl;
+        if (mesen_bridge_ready()) {
+            mesen_bridge_set_overclock((uint32_t)sl);
+            log_line("[mmlc] overclock: CPU SPEED=%.3f -> %d scanlines",
+                     speed, sl);
+        }
+    }
+}
+
+/* Watch the MMLC options file and map CPU SPEED (ORIGINAL/TURBO) onto Mesen's
+ * NES overclock. Logs the raw bytes whenever it changes. */
 static DWORD WINAPI mesen_options_watch_thread(LPVOID p)
 {
     (void)p;
@@ -708,7 +741,7 @@ static DWORD WINAPI mesen_options_watch_thread(LPVOID p)
     log_line("[mmlc] options watch: %s", path);
     static BYTE last[256];
     DWORD lastlen = 0;
-    for (int i = 0; i < 1200; i++) {
+    for (;;) {
         FILE *f = fopen(path, "rb");
         if (f) {
             BYTE buf[256];
@@ -726,6 +759,7 @@ static DWORD WINAPI mesen_options_watch_thread(LPVOID p)
                     log_line("[mmlc] options fields: f0x28=%g u0x24=%u u0x2c=%u "
                              "u0x30=%u", spd, *(uint32_t *)(buf + 0x24),
                              *(uint32_t *)(buf + 0x2c), *(uint32_t *)(buf + 0x30));
+                    mesen_apply_overclock(spd);
                 }
                 memcpy(last, buf, r);
                 lastlen = (DWORD)r;
@@ -1885,14 +1919,21 @@ static DWORD WINAPI init_thread(LPVOID param)
                 log_line("[mmlc] engine priority set to BELOW_NORMAL");
             }
             g_mesen_null_rom = cfg_flag(ini, "mesen_null_rom", 1);
+            g_oc_follow = cfg_flag(ini, "mesen_overclock_follow", 1);
             {
                 char ov[16] = "";
-                cfg_get(ini, "mesen_overclock", ov, sizeof(ov));
-                if (ov[0])
-                    mesen_bridge_set_overclock((uint32_t)atoi(ov));
+                if (cfg_get(ini, "mesen_overclock", ov, sizeof(ov)) && ov[0])
+                    g_oc_manual = atoi(ov);
+                char ot[16] = "";
+                if (cfg_get(ini, "mesen_overclock_turbo", ot, sizeof(ot)) && ot[0])
+                    g_oc_turbo = atoi(ot);
             }
-            log_line("[mmlc] mesen opts: freeze=%d ram_sync=%d null_rom=%d",
-                     g_mesen_freeze, g_ram_sync, g_mesen_null_rom);
+            if (g_oc_manual >= 0)
+                mesen_apply_overclock(1.0f);   /* explicit override */
+            log_line("[mmlc] mesen opts: freeze=%d ram_sync=%d null_rom=%d "
+                     "overclock(follow=%d manual=%d turbo=%d)",
+                     g_mesen_freeze, g_ram_sync, g_mesen_null_rom,
+                     g_oc_follow, g_oc_manual, g_oc_turbo);
             {
                 HANDLE h = CreateThread(NULL, 0, mesen_engine_probe_thread,
                                         NULL, 0, NULL);

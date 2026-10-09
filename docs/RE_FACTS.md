@@ -297,6 +297,17 @@ tables inside `data.pie`; there is no separate menu binary format.
 - Entry layout: `salt(16) | pw_verify(2) | ciphertext | hmac(10)`.
 - Save path (Proton): `.../compatdata/363440/pfx/drive_c/users/steamuser/AppData/Roaming/MegaMan/<id>/`.
 
+## MMLC options (Options2.sav) / CPU SPEED
+
+- Path (Proton): `.../compatdata/363440/pfx/drive_c/users/steamuser/AppData/Roaming/MegaMan/<id>/Options2.sav`.
+- Magic `OPTI`; **CPU SPEED** (locale `"CPU SPEED"` / `"ORIGINAL"` / `"TURBO"`) is a
+  **float at `+0x28`** (vanilla `1.0`). Keybinds are u32 from `+0x3c`.
+- The proxy watches this file and maps TURBO onto Mesen's NES overclock:
+  `mesen_overclock_follow=1` (default) follows the in-game option,
+  `mesen_overclock_turbo` = scanlines for TURBO (default 262), and
+  `mesen_overclock` pins an explicit count (disables following). Exposed via
+  `20xx overclock`.
+
 ## Steam API
 
 - `Proteus.exe` imports `steam_api.dll` (plus KERNEL32, MSVCP140, d3d11,

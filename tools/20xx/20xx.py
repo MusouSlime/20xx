@@ -683,6 +683,36 @@ def cmd_unpack(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_overclock(args: argparse.Namespace) -> int:
+    """Configure the NES overclock. By default it follows MMLC's in-game
+    CPU SPEED option (ORIGINAL/TURBO); --scanlines pins an explicit value."""
+    gd = args.game_dir
+    vals: Dict[str, str] = {}
+    if args.off:
+        vals = {"mesen_overclock_follow": "0", "mesen_overclock": "0"}
+    else:
+        if args.follow is not None:
+            vals["mesen_overclock_follow"] = "1" if args.follow else "0"
+        if args.scanlines is not None:
+            if args.scanlines < 0:
+                print("20xx: --scanlines must be >= 0")
+                return 2
+            vals["mesen_overclock"] = str(args.scanlines)
+        if args.turbo is not None:
+            if args.turbo < 0:
+                print("20xx: --turbo must be >= 0")
+                return 2
+            vals["mesen_overclock_turbo"] = str(args.turbo)
+    if vals:
+        ini_set(gd, vals)
+    print("[20xx] overclock settings:")
+    for k in ("mesen_overclock_follow", "mesen_overclock",
+              "mesen_overclock_turbo"):
+        print(f"  {k} = {ini_get(gd, k) or '(default)'}")
+    print("  (restart the game for changes to take effect)")
+    return 0
+
+
 def cmd_list(_: argparse.Namespace) -> int:
     print(f"{APP} v{VERSION}")
     for k in GAME_ORDER:
@@ -1168,6 +1198,14 @@ def cmd_gui(args: argparse.Namespace) -> int:
     hack_cb = ttk.Combobox(f4, textvariable=hack, values=["<none>"],
                            state="readonly", width=30)
     hack_cb.grid(row=1, column=3, padx=6)
+    oc_follow = tk.BooleanVar(value=bool(cfg.get("oc_follow", True)))
+    oc_turbo = tk.StringVar(value=str(cfg.get("oc_turbo", 262)))
+    ttk.Checkbutton(f4, text="Overclock: follow in-game CPU SPEED",
+                    variable=oc_follow).grid(row=2, column=0, columnspan=2,
+                                             sticky="w", padx=6, pady=4)
+    ttk.Label(f4, text="Turbo scanlines").grid(row=2, column=2, sticky="w", padx=6)
+    ttk.Entry(f4, textvariable=oc_turbo, width=8).grid(row=2, column=3,
+                                                       sticky="w", padx=6)
 
     f6 = ttk.LabelFrame(root, text="4. Controls (NES button -> Xbox button)")
     f6.pack(fill="x", padx=10, pady=6)
@@ -1268,6 +1306,14 @@ def cmd_gui(args: argparse.Namespace) -> int:
             logq.put(f"[20xx] mesen core: {c}")
             if not check_core(c):
                 logq.put("WARNING: core is missing MMLC hooks (see mesen2_capture.patch)")
+        try:
+            turbo = int(oc_turbo.get().strip() or "262")
+        except ValueError:
+            turbo = 262
+        ini_set(gd, {"mesen_overclock_follow": "1" if oc_follow.get() else "0",
+                     "mesen_overclock_turbo": str(turbo)})
+        logq.put(f"[20xx] overclock: follow in-game CPU SPEED="
+                 f"{oc_follow.get()} turbo={turbo} scanlines")
         logq.put(f"[20xx] romhacks folder: {ensure_romhacks_dir(gd)}")
         write_input_map(gd, {k: v.get() for k, v in input_vars.items()})
         host = ensure_host()
@@ -1278,6 +1324,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
         c2 = dict(gui_config_load())
         c2.update({"game_dir": gd, "core": c,
                    "steamless": steamless_cli.get().strip(),
+                   "oc_follow": bool(oc_follow.get()), "oc_turbo": turbo,
                    "input_map": {k: v.get() for k, v in input_vars.items()}})
         gui_config_save(c2)
         logq.put("[20xx] setup complete.")
@@ -1599,6 +1646,20 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--force", action="store_true",
                     help="re-unpack even if Proteus.exe is already unpacked")
     up.set_defaults(func=cmd_unpack)
+    oc = sub.add_parser("overclock", help="NES overclock; follows MMLC's "
+                                          "in-game CPU SPEED (ORIGINAL/TURBO) "
+                                          "by default")
+    oc.add_argument("--follow", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="follow the in-game CPU SPEED option (default: on)")
+    oc.add_argument("--scanlines", type=int, default=None,
+                    help="explicit scanline count (disables following)")
+    oc.add_argument("--turbo", type=int, default=None,
+                    help="scanlines used when the in-game option is TURBO "
+                         "(default: 262)")
+    oc.add_argument("--off", action="store_true",
+                    help="disable the overclock entirely")
+    oc.set_defaults(func=cmd_overclock)
     bc = sub.add_parser("build-core",
                         help="clone+patch+build the Mesen2 core (MesenCore.so)")
     bc.add_argument("--dir", default=None, help="where to clone/build Mesen2")
