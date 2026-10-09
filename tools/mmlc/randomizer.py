@@ -18,8 +18,8 @@ present byte-for-byte, so the community algorithms port directly.
   dmarchand/mm5randomizer (``System.Random(int_seed)``) and the weapon-get
   reward is a byte-for-byte port of the same tool's ``WeaponGetRandomizer``
   (offsets remapped to the MMLC ROM); palette is a 20xx shuffle.
-* ``mm6`` -- not implemented yet (no upstream tool and its damage tables are
-  not yet located).
+* ``mm6`` -- weapon-get (reward) shuffle only (own design); the boss
+  damage/weakness and palette tables are not located yet.
 
 Everything operates on a headerless PRG ``bytearray`` in place and is fully
 deterministic for a given ``seed``.
@@ -1035,6 +1035,57 @@ def randomize_mm4(prg: bytearray, seed, *, weakness: bool = True,
     return sp
 
 
+# --- MM6: weapon-get (reward) shuffle (own design) --------------------------
+# No open reference tool; the boss damage/weakness tables are still unlocated
+# (the MMLC ROM is compressed), so only the reward table is randomized here.
+# The weapon-get wall uses a single 8-byte table indexed by level ($51): the
+# value written to $0699 (current weapon) is the weapon id. The name and icon
+# are then looked up from *that* id (text id = weapon+0xAF; icon = $F708,y), so
+# permuting the table is self-consistent. Located from the Mega Man 6
+# disassembly: `LDA $F700,y; STA $0699` @ CPU $3BBDBA, table @ CPU $3FF700.
+MM6_PRG_SIZE = 0x80000
+MM6_REWARD_TABLE = 0x7F700              # PRG: level -> weapon id (8 robot stages)
+MM6_WEAPON_NAMES = {
+    1: "Yamato Spear", 2: "Wind Storm", 3: "Blizzard Attack", 4: "Flame Blast",
+    5: "Plant Barrier", 6: "Knight Crusher", 7: "Silver Tomahawk",
+    8: "Centaur Flash",
+}
+# Level ($51) order == the stage whose vanilla reward is that boss's own weapon.
+MM6_STAGE_ORDER = ["Blizzard Man", "Wind Man", "Plant Man", "Flame Man",
+                   "Yamato Man", "Tomahawk Man", "Knight Man", "Centaur Man"]
+
+
+def _mm6_shuffle_reward(prg: bytearray, rng: "_Rng") -> Dict[str, str]:
+    vals = [prg[MM6_REWARD_TABLE + s] for s in range(8)]
+    perm = list(range(8))
+    for i in range(7, 0, -1):
+        j = rng.below(i + 1)
+        perm[i], perm[j] = perm[j], perm[i]
+    for s in range(8):
+        prg[MM6_REWARD_TABLE + s] = vals[perm[s]]
+    return {MM6_STAGE_ORDER[s]: MM6_WEAPON_NAMES.get(prg[MM6_REWARD_TABLE + s], "?")
+            for s in range(8)}
+
+
+def randomize_mm6(prg: bytearray, seed, *, weakness: bool = True,
+                  weapons: bool = True, palette: bool = True,
+                  visualizer: bool = False) -> Spoiler:
+    """Randomize an MM6 PRG.
+
+    Only the weapon-get (reward) table is randomized: the damage/weakness and
+    palette tables are not located yet, so `weakness`/`palette`/`visualizer`
+    are accepted but ignored.
+    """
+    if len(prg) != MM6_PRG_SIZE:
+        raise RandomizerError(
+            f"MM6 PRG must be {MM6_PRG_SIZE:#x} bytes, got {len(prg):#x}")
+    sp = Spoiler("mm6", seed)
+    if weapons:
+        sp.rewards = _mm6_shuffle_reward(prg, _rng(f"{seed}:mm6:weapon"))
+        sp.order = list(MM6_STAGE_ORDER)
+    return sp
+
+
 # --- registry -------------------------------------------------------------- #
 
 GAMES = {
@@ -1043,6 +1094,7 @@ GAMES = {
     "mm3": {"prg_size": MM3_PRG_SIZE, "fn": randomize_mm3},
     "mm4": {"prg_size": MM4_PRG_SIZE, "fn": randomize_mm4},
     "mm5": {"prg_size": MM5_PRG_SIZE, "fn": randomize_mm5},
+    "mm6": {"prg_size": MM6_PRG_SIZE, "fn": randomize_mm6},
 }
 
 

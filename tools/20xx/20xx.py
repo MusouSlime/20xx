@@ -13,6 +13,8 @@ Usage (all commands are terminal/CLI; no GUI required):
     20xx.py list                     # list the 12 games
     20xx.py verify                   # check the ROM anchors in the install
     20xx.py extract [--game KEY]     # write vanilla .nes files into <game>/roms/
+    20xx.py export [GAME] [opts]     # export the 12 ROMs (patched where picked)
+                                     #   to ~/MMLC-ROMs for your own emulator
     20xx.py patch GAME [opts]        # offline randomizer / palette / ROM hacks
     20xx.py play [GAME] [opts]       # patch + start host + launch, from the CLI
     20xx.py launch [--print]         # launch the collection (or print the cmd)
@@ -253,8 +255,9 @@ def extract(game_dir: str, out_dir: str, game: Optional[str] = None,
 # Games with an offline randomizer: MM1 (weakness/rewards/palette);
 # MM2/MM3/MM5 (weakness + reward + palette, MM2/MM3/MM5 weaknesses and the MM5
 # weapon-get reward are byte-for-byte ports of the upstream tools); MM4
-# (weakness + reward + palette, own deterministic shuffles).
-RANDO_GAMES = {"mm1", "mm2", "mm3", "mm4", "mm5"}
+# (weakness + reward + palette, own deterministic shuffles); MM6 (weapon-get
+# reward only -- damage/weakness and palettes are not located yet).
+RANDO_GAMES = {"mm1", "mm2", "mm3", "mm4", "mm5", "mm6"}
 
 
 def random_seed(length: int = 5) -> str:
@@ -741,6 +744,48 @@ def prepare_roms(game_dir: str, out: str, *, source: Optional[str] = None,
     print(f"[20xx] prepared ROMs in {out}")
 
 
+# Friendly filenames for exporting to the user's own emulators.
+REGION_TAG = {"US": "USA", "JP": "Japan"}
+
+
+def export_roms(game_dir: str, dest: str, *, source: Optional[str] = None,
+                target: str = "all", seed: Optional[str] = None,
+                weakness: bool = True, weapons: bool = True,
+                palette: bool = True, visualizer: bool = False,
+                romhacks: Optional[List[str]] = None,
+                ips_adjust: int = 0, auto_romhacks: bool = True,
+                quiet: bool = False) -> Dict[str, str]:
+    """Extract the 12 ROMs (patched where selected) to *dest* with friendly
+    filenames, for use in the user's own emulators. Returns key -> path.
+
+    Same options as :func:`prepare_roms`: `target` is a game key or 'all';
+    games other than the target are exported vanilla."""
+    src = find_source(game_dir, source)
+    pe = PE(src)
+    os.makedirs(dest, exist_ok=True)
+    written: Dict[str, str] = {}
+    for k in GAME_ORDER:
+        g = romtable.GAMES[k]
+        opts = {}
+        if target in ("all", k):
+            hacks = list(romhacks or [])
+            if auto_romhacks:
+                hacks = discover_romhacks(game_dir, k) + hacks
+            opts = dict(seed=(seed if k in RANDO_GAMES else None),
+                        weakness=weakness, weapons=weapons, palette=palette,
+                        visualizer=visualizer, romhacks=hacks,
+                        ips_adjust=ips_adjust)
+        name = f"{g.title} ({REGION_TAG.get(g.region, g.region)}).nes"
+        out = os.path.join(dest, name)
+        write_file_atomic(out, build_patched_nes(g, pe, **opts))
+        written[k] = out
+    if not quiet:
+        for k in GAME_ORDER:
+            print(f"  {os.path.basename(written[k])}")
+        print(f"[20xx] exported {len(written)} ROM(s) to {dest}")
+    return written
+
+
 def ensure_mesen_host(game_dir: str) -> bool:
     """Start the Mesen host if the replacer is enabled (auto-detecting a core)."""
     if ini_get(game_dir, "mesen") != "1":
@@ -811,6 +856,24 @@ def cmd_patch(args: argparse.Namespace) -> int:
                weakness=args.weakness, weapons=args.weapons, palette=args.palette,
                visualizer=args.visualizer, romhacks=args.romhack,
                ips_adjust=args.ips_adjust, auto_romhacks=not args.no_romhacks)
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Export the ROMs (patched where selected) for the user's own emulators."""
+    dest = args.dest or os.path.expanduser("~/MMLC-ROMs")
+    if args.vanilla:
+        seed = None
+        weakness = weapons = palette = visualizer = False
+    else:
+        _apply_palette_only(args)
+        seed = _seed_arg(args)
+        weakness, weapons, palette = args.weakness, args.weapons, args.palette
+        visualizer = args.visualizer
+    export_roms(args.game_dir, dest, source=args.source, target=args.game,
+                seed=seed, weakness=weakness, weapons=weapons, palette=palette,
+                visualizer=visualizer, romhacks=args.romhack,
+                ips_adjust=args.ips_adjust, auto_romhacks=not args.no_romhacks)
     return 0
 
 
@@ -1131,6 +1194,9 @@ def cmd_gui(args: argparse.Namespace) -> int:
     ttk.Button(f5, text="Rescan hacks",
                command=lambda: (refresh_hacks(), logq.put("[20xx] romhack list refreshed"))
                ).pack(side="left", padx=6)
+    ttk.Button(f5, text="Export ROMs...",
+               command=lambda: run(export_task)
+               ).pack(side="left", padx=6)
 
     log = ScrolledText(root, height=15, state="disabled", font=("monospace", 9))
     log.pack(fill="both", expand=True, padx=10, pady=(4, 10))
@@ -1230,8 +1296,8 @@ def cmd_gui(args: argparse.Namespace) -> int:
                      f"{'ok' if ok else 'MISMATCH'}")
         logq.put(f"[20xx] verify: {len(GAME_ORDER) - bad}/{len(GAME_ORDER)} ok")
 
-    def launch_task():
-        gd = game_dir.get().strip()
+    def gui_patch_opts(gd):
+        """Build the patch options from the GUI widgets for one game."""
         key = game_labels.get(game_label.get(), GAME_ORDER[0])
         m = mode.get()
         opts: dict = {"target": key, "auto_romhacks": False}
@@ -1259,7 +1325,14 @@ def cmd_gui(args: argparse.Namespace) -> int:
                 hs = "<all>"
             else:
                 logq.put(f"[20xx] no patches in romhacks/{key}/ — drop .ips/.bps there")
-                return
+                return key, m, None, hs
+        return key, m, opts, hs
+
+    def launch_task():
+        gd = game_dir.get().strip()
+        key, m, opts, hs = gui_patch_opts(gd)
+        if opts is None:
+            return
         write_input_map(gd, {k: v.get() for k, v in input_vars.items()})
         logq.put(f"[20xx] {key}: {m} seed={opts.get('seed', '-')} hack={hs}")
         prepare_roms(gd, os.path.join(gd, "roms"), **opts)
@@ -1269,6 +1342,25 @@ def cmd_gui(args: argparse.Namespace) -> int:
         except Exception as ex:
             logq.put(f"[20xx] host start failed (continuing): {ex}")
         launch(args.appid)
+
+    def export_task():
+        gd = game_dir.get().strip()
+        if not gd:
+            logq.put("Set the install folder first.")
+            return
+        key, m, opts, hs = gui_patch_opts(gd)
+        if opts is None:
+            return
+        dest = filedialog.askdirectory(
+            initialdir=os.path.expanduser("~"),
+            title="Export ROMs to folder")
+        if not dest:
+            logq.put("[20xx] export cancelled")
+            return
+        logq.put(f"[20xx] {key}: {m} seed={opts.get('seed', '-')} hack={hs}")
+        dest = os.path.join(dest, "MMLC-ROMs")
+        export_roms(gd, dest, **opts)
+        logq.put(f"[20xx] open this folder in your emulator: {dest}")
 
     refresh_hacks()
     pump()
@@ -1469,6 +1561,15 @@ def build_parser() -> argparse.ArgumentParser:
     pch.add_argument("game")
     _add_patch_opts(pch)
     pch.set_defaults(func=cmd_patch)
+    ex = sub.add_parser("export", help="extract the 12 ROMs (patched where "
+                                       "selected) for your own emulators")
+    ex.add_argument("game", nargs="?", default="all")
+    ex.add_argument("--dest", default=None,
+                    help="destination folder (default: ~/MMLC-ROMs)")
+    ex.add_argument("--vanilla", action="store_true",
+                    help="export unpatched ROMs (ignore the patch options)")
+    _add_patch_opts(ex)
+    ex.set_defaults(func=cmd_export)
     rh = sub.add_parser("romhacks", help="list/create the romhacks/ drop-in folder")
     rh.add_argument("game", nargs="?", default="all")
     rh.set_defaults(func=cmd_romhacks)

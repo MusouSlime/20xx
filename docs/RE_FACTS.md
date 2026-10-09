@@ -327,6 +327,19 @@ JP parity: RK1–RK5 share the *same* palette-data offsets as their US counterpa
 MM3/RK3, MM5/RK5). So a US-targeted palette patch covers the JP ROMs for those
 five; only MM4's copies shift slightly and MM6 is unresolved.
 
+## MM6 reward (weapon-get) table — FOUND
+
+From the Mega Man 6 disassembly (`LDA $F700,y; STA $0699` @ CPU `$3BBDBA`):
+- **PRG `0x7F700`** (CPU `$3FF700`), 8 bytes, indexed by level `$51`:
+  vanilla = `03 02 05 04 01 07 06 08` → every stage gives its own boss's weapon.
+- Weapon id order (RAM `$0688`..`$0691`): buster, **Yamato, Wind, Blizzard,
+  Fire, Plant, Knight, Silver, Centaur**, Beat. So level order is
+  Blizzard, Wind, Plant, Flame, Yamato, Tomahawk, Knight, Centaur.
+- The get-screen name/icon are derived from the *granted weapon id*
+  (`text id = weapon + 0xAF`; icon = `$F708,y`), so permuting the table is
+  self-consistent. `randomize_mm6` does exactly this.
+- Adjacent: `$F708` (`00 57 5D 58 59 5A 5C 5B`) = per-weapon get-screen icon ids.
+
 ## MM6 damage table (randomizer) — status: not located
 
 The standalone `Mega Man 6 (USA).nes` is byte-identical to the MMLC-extracted
