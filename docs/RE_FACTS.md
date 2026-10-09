@@ -310,12 +310,13 @@ tables inside `data.pie`; there is no separate menu binary format.
 
 ## Mesen save states (hotkeys)
 
-- The core exports `SaveState`/`LoadState` (in-memory slots) and the host already
-  handles `MESEN_CMD_SAVE_STATE`/`LOAD_STATE`; the proxy now binds them to
-  controller combos: **LB+Y = save**, **LB+B = load** (slot 0). Configurable via
-  `state_save_button` / `state_load_button` (e.g. `lb+y`, `"0"` disables) and
-  `state_slot`. Exposed via `20xx states`. Both LB and Y/B are unused by the
-  default NES mapping, so the combos don't disturb play.
+- The core exports `SaveState`/`LoadState`/`ResetConsole` and the host handles
+  `MESEN_CMD_SAVE_STATE`/`LOAD_STATE`/`RESET`; the proxy binds them to controller
+  combos: **LB+Y = save**, **LB+B = load**, **LB+X = reset** (slot 0).
+  Configurable via `state_save_button` / `state_load_button` /
+  `state_reset_button` (e.g. `lb+y`, `"0"` disables) and `state_slot`. Exposed via
+  `20xx states`. LB/Y/B/X are unused by the default NES mapping, so the combos
+  don't disturb play.
 
 ## Steam API
 

@@ -35,9 +35,10 @@ bytes verbatim, which is exactly what a randomizer expects.
   `romhacks/<game>/` and 20XX applies them when it patches the ROM.
 - **Export for other emulators:** `20xx export` writes the 12 ROMs (patched
   where selected) to `~/MMLC-ROMs` with friendly names, for use in any emulator.
-- **Save-state hotkeys** (Mesen mode): **LB+Y** saves, **LB+B** loads (slot 0).
-  Set them in the GUI's **4. Controls** section (modifier + button + slot) or via
-  `20xx states --save-button ... --load-button ... --slot N`.
+- **Save-state hotkeys** (Mesen mode): **LB+Y** saves, **LB+B** loads, **LB+X**
+  soft-resets the console (slot 0). Set them in the GUI's **4. Controls** section
+  (modifier + button + slot) or via `20xx states --save-button ...
+  --load-button ... --reset-button ... --slot N`.
   Overclock follows MMLC's in-game **CPU SPEED** option; tune with `20xx overclock`.
 - **Launcher:** a terminal UI (`20xx`), a Tk GUI (`20xx gui`), and a Steam
   pre-launch hook (`20xx prelaunch %command%`).

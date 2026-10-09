@@ -1530,12 +1530,14 @@ static DWORD g_btn_a = 0x1000, g_btn_b = 0x4000, g_btn_select = 0x0200,
              g_btn_start = 0x0010, g_btn_up = 0x0001, g_btn_down = 0x0002,
              g_btn_left = 0x0004, g_btn_right = 0x0008;
 
-/* Mesen save-state hotkeys (combo masks). Defaults: LB+Y save, LB+B load.
- * Both LB and Y/B are unused by the default NES mapping, so the combo is a
- * pure hotkey. Configurable via `state_save_button` / `state_load_button`
- * (e.g. "lb+y"); `state_slot` picks the slot. */
+/* Mesen hotkey combos. Defaults: LB+Y save, LB+B load, LB+X reset (soft reset;
+ * Mesen auto-loads its state on reset). LB/Y/B/X are unused by the default NES
+ * mapping, so the combos are pure hotkeys. Configurable via
+ * `state_save_button` / `state_load_button` / `state_reset_button`
+ * (e.g. "lb+y"); `state_slot` picks the save slot. */
 static DWORD g_state_save_btn = 0x8100;  /* LB(0x100) | Y(0x8000) */
 static DWORD g_state_load_btn = 0x2100;  /* LB(0x100) | B(0x2000) */
+static DWORD g_state_reset_btn = 0x4100; /* LB(0x100) | X(0x4000) */
 static int g_state_slot = 0;
 static DWORD g_state_prev = 0;
 
@@ -1647,7 +1649,7 @@ static DWORD WINAPI hook_XInputGetState(DWORD idx, void *state)
             g_last_nes_tick = GetTickCount();
             mesen_bridge_set_input(0, nes);
         }
-        /* Save/load state hotkeys (rising edge on the combo). */
+        /* Save/load/reset hotkeys (rising edge on the combo). */
         if (r == ERROR_SUCCESS && state) {
             if (g_state_save_btn &&
                 (btn & g_state_save_btn) == g_state_save_btn) {
@@ -1659,6 +1661,11 @@ static DWORD WINAPI hook_XInputGetState(DWORD idx, void *state)
                 if ((g_state_prev & g_state_load_btn) != g_state_load_btn &&
                     mesen_bridge_load_state((uint32_t)g_state_slot) == 0)
                     log_line("[mmlc] state loaded (slot %d)", g_state_slot);
+            } else if (g_state_reset_btn &&
+                       (btn & g_state_reset_btn) == g_state_reset_btn) {
+                if ((g_state_prev & g_state_reset_btn) != g_state_reset_btn &&
+                    mesen_bridge_reset() == 0)
+                    log_line("[mmlc] console reset");
             }
             g_state_prev = btn;
         }
@@ -2042,12 +2049,16 @@ static DWORD WINAPI init_thread(LPVOID param)
             DWORD b = parse_button_combo(v);
             if (b) g_state_load_btn = b;
         }
+        if (cfg_get(ini, "state_reset_button", v, sizeof(v)) && v[0]) {
+            DWORD b = parse_button_combo(v);
+            if (b) g_state_reset_btn = b;
+        }
         if (cfg_get(ini, "state_slot", v, sizeof(v)) && v[0])
             g_state_slot = atoi(v);
     }
-    log_line("[mmlc] state hotkeys: save=%#lx load=%#lx slot=%d",
+    log_line("[mmlc] state hotkeys: save=%#lx load=%#lx reset=%#lx slot=%d",
              (unsigned long)g_state_save_btn, (unsigned long)g_state_load_btn,
-             g_state_slot);
+             (unsigned long)g_state_reset_btn, g_state_slot);
     g_skip_intro = cfg_flag(ini, "skip_intro", 1);
     if (g_skip_intro)
         install_intro_skip(target);

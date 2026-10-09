@@ -714,21 +714,28 @@ def cmd_overclock(args: argparse.Namespace) -> int:
 
 
 def cmd_states(args: argparse.Namespace) -> int:
-    """Configure the Mesen save/load-state hotkeys (handy for ROM-hack testing).
-    Defaults: LB+Y = save, LB+B = load, slot 0."""
+    """Configure the Mesen save/load-state and reset hotkeys (handy for
+    ROM-hack testing). Defaults: LB+Y save, LB+B load, LB+X reset, slot 0."""
     gd = args.game_dir
     vals: Dict[str, str] = {}
     off = {"off", "none", ""}
+
+    def combo(flag):
+        return "0" if flag.lower() in off else flag
+
     if args.save_button is not None:
-        vals["state_save_button"] = "0" if args.save_button.lower() in off else args.save_button
+        vals["state_save_button"] = combo(args.save_button)
     if args.load_button is not None:
-        vals["state_load_button"] = "0" if args.load_button.lower() in off else args.load_button
+        vals["state_load_button"] = combo(args.load_button)
+    if args.reset_button is not None:
+        vals["state_reset_button"] = combo(args.reset_button)
     if args.slot is not None:
         vals["state_slot"] = str(args.slot)
     if vals:
         ini_set(gd, vals)
     print("[20xx] save-state hotkeys (restart the game to apply):")
-    for k in ("state_save_button", "state_load_button", "state_slot"):
+    for k in ("state_save_button", "state_load_button", "state_reset_button",
+              "state_slot"):
         print(f"  {k} = {ini_get(gd, k) or '(default)'}")
     return 0
 
@@ -1050,6 +1057,7 @@ STATE_BUTTONS = ["a", "b", "x", "y", "lb", "rb", "back", "start", "ls", "rs",
                  "dpad_up", "dpad_down", "dpad_left", "dpad_right", "off"]
 DEFAULT_SAVE_STATE = "lb+y"
 DEFAULT_LOAD_STATE = "lb+b"
+DEFAULT_RESET_STATE = "lb+x"
 
 
 def split_state_combo(s: str):
@@ -1265,15 +1273,19 @@ def cmd_gui(args: argparse.Namespace) -> int:
         ttk.Combobox(f6, textvariable=v, values=INPUT_CHOICES, state="readonly",
                      width=10).grid(row=r, column=c * 2 + 1, sticky="w", padx=4)
         input_vars[key] = v
-    # Save/load-state hotkeys (modifier + button).
+    # Save/load-state and reset hotkeys (modifier + button).
     sv_mod, sv_btn = split_state_combo(
         cfg.get("state_save_button", DEFAULT_SAVE_STATE))
     ld_mod, ld_btn = split_state_combo(
         cfg.get("state_load_button", DEFAULT_LOAD_STATE))
+    rs_mod, rs_btn = split_state_combo(
+        cfg.get("state_reset_button", DEFAULT_RESET_STATE))
     save_mod = tk.StringVar(value=sv_mod)
     save_btn = tk.StringVar(value=sv_btn)
     load_mod = tk.StringVar(value=ld_mod)
     load_btn = tk.StringVar(value=ld_btn)
+    reset_mod = tk.StringVar(value=rs_mod)
+    reset_btn = tk.StringVar(value=rs_btn)
     state_slot = tk.StringVar(value=str(cfg.get("state_slot", 0)))
     ttk.Label(f6, text="Save state").grid(row=2, column=0, sticky="e", padx=4, pady=3)
     ttk.Combobox(f6, textvariable=save_mod, values=STATE_MODIFIERS,
@@ -1287,8 +1299,13 @@ def cmd_gui(args: argparse.Namespace) -> int:
                  state="readonly", width=9).grid(row=2, column=5, sticky="w")
     ttk.Label(f6, text="Slot").grid(row=2, column=6, sticky="e", padx=4)
     ttk.Entry(f6, textvariable=state_slot, width=4).grid(row=2, column=7, sticky="w")
+    ttk.Label(f6, text="Reset").grid(row=3, column=0, sticky="e", padx=4, pady=3)
+    ttk.Combobox(f6, textvariable=reset_mod, values=STATE_MODIFIERS,
+                 state="readonly", width=6).grid(row=3, column=1, sticky="w")
+    ttk.Combobox(f6, textvariable=reset_btn, values=STATE_BUTTONS,
+                 state="readonly", width=9).grid(row=3, column=2, sticky="w")
     ttk.Button(f6, text="Save controls", command=lambda: run(save_controls)
-               ).grid(row=3, column=0, columnspan=2, pady=4, sticky="w")
+               ).grid(row=4, column=0, columnspan=2, pady=4, sticky="w")
 
     f5 = ttk.Frame(root)
     f5.pack(fill="x", padx=10, pady=4)
@@ -1347,19 +1364,21 @@ def cmd_gui(args: argparse.Namespace) -> int:
         gd = game_dir.get().strip()
         sv = join_state_combo(save_mod.get(), save_btn.get())
         ld = join_state_combo(load_mod.get(), load_btn.get())
+        rs = join_state_combo(reset_mod.get(), reset_btn.get())
         slot = state_slot.get().strip() or "0"
         if gd:
             write_input_map(gd, m)
             ini_set(gd, {"state_save_button": sv, "state_load_button": ld,
-                         "state_slot": slot})
+                         "state_reset_button": rs, "state_slot": slot})
         c = dict(gui_config_load())
         c.update({"game_dir": gd, "core": core.get().strip(),
                   "steamless": steamless_cli.get().strip(), "input_map": m,
                   "state_save_button": sv, "state_load_button": ld,
-                  "state_slot": slot})
+                  "state_reset_button": rs, "state_slot": slot})
         gui_config_save(c)
         logq.put("[20xx] controls saved: "
                  + ", ".join(f"{k[4:]}={v}" for k, v in m.items()))
+        logq.put(f"[20xx] state hotkeys: save={sv} load={ld} reset={rs} slot={slot}")
         logq.put(f"[20xx] state hotkeys: save={sv} load={ld} slot={slot}")
 
     def setup_task():
@@ -1393,9 +1412,11 @@ def cmd_gui(args: argparse.Namespace) -> int:
         write_input_map(gd, {k: v.get() for k, v in input_vars.items()})
         sv = join_state_combo(save_mod.get(), save_btn.get())
         ld = join_state_combo(load_mod.get(), load_btn.get())
+        rs = join_state_combo(reset_mod.get(), reset_btn.get())
         ini_set(gd, {"state_save_button": sv, "state_load_button": ld,
+                     "state_reset_button": rs,
                      "state_slot": state_slot.get().strip() or "0"})
-        logq.put(f"[20xx] state hotkeys: save={sv} load={ld}")
+        logq.put(f"[20xx] state hotkeys: save={sv} load={ld} reset={rs}")
         host = ensure_host()
         if host:
             logq.put(f"[20xx] mesen_host: {host}")
@@ -1406,6 +1427,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
                    "steamless": steamless_cli.get().strip(),
                    "oc_follow": bool(oc_follow.get()), "oc_turbo": turbo,
                    "state_save_button": sv, "state_load_button": ld,
+                   "state_reset_button": rs,
                    "state_slot": state_slot.get().strip() or "0",
                    "input_map": {k: v.get() for k, v in input_vars.items()}})
         gui_config_save(c2)
@@ -1465,6 +1487,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
         write_input_map(gd, {k: v.get() for k, v in input_vars.items()})
         ini_set(gd, {"state_save_button": join_state_combo(save_mod.get(), save_btn.get()),
                      "state_load_button": join_state_combo(load_mod.get(), load_btn.get()),
+                     "state_reset_button": join_state_combo(reset_mod.get(), reset_btn.get()),
                      "state_slot": state_slot.get().strip() or "0"})
         logq.put(f"[20xx] {key}: {m} seed={opts.get('seed', '-')} hack={hs}")
         prepare_roms(gd, os.path.join(gd, "roms"), **opts)
@@ -1751,6 +1774,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="combo that saves a state, e.g. lb+y (or 'off')")
     st.add_argument("--load-button", default=None,
                     help="combo that loads a state, e.g. lb+b (or 'off')")
+    st.add_argument("--reset-button", default=None,
+                    help="combo that soft-resets the console, e.g. lb+x (or 'off')")
     st.add_argument("--slot", type=int, default=None,
                     help="save-state slot (default 0)")
     st.set_defaults(func=cmd_states)
