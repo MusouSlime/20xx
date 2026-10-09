@@ -713,6 +713,26 @@ def cmd_overclock(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_states(args: argparse.Namespace) -> int:
+    """Configure the Mesen save/load-state hotkeys (handy for ROM-hack testing).
+    Defaults: LB+Y = save, LB+B = load, slot 0."""
+    gd = args.game_dir
+    vals: Dict[str, str] = {}
+    off = {"off", "none", ""}
+    if args.save_button is not None:
+        vals["state_save_button"] = "0" if args.save_button.lower() in off else args.save_button
+    if args.load_button is not None:
+        vals["state_load_button"] = "0" if args.load_button.lower() in off else args.load_button
+    if args.slot is not None:
+        vals["state_slot"] = str(args.slot)
+    if vals:
+        ini_set(gd, vals)
+    print("[20xx] save-state hotkeys (restart the game to apply):")
+    for k in ("state_save_button", "state_load_button", "state_slot"):
+        print(f"  {k} = {ini_get(gd, k) or '(default)'}")
+    return 0
+
+
 def cmd_list(_: argparse.Namespace) -> int:
     print(f"{APP} v{VERSION}")
     for k in GAME_ORDER:
@@ -1660,6 +1680,15 @@ def build_parser() -> argparse.ArgumentParser:
     oc.add_argument("--off", action="store_true",
                     help="disable the overclock entirely")
     oc.set_defaults(func=cmd_overclock)
+    st = sub.add_parser("states", help="Mesen save/load-state hotkeys (for "
+                                       "ROM-hack testing)")
+    st.add_argument("--save-button", default=None,
+                    help="combo that saves a state, e.g. lb+y (or 'off')")
+    st.add_argument("--load-button", default=None,
+                    help="combo that loads a state, e.g. lb+b (or 'off')")
+    st.add_argument("--slot", type=int, default=None,
+                    help="save-state slot (default 0)")
+    st.set_defaults(func=cmd_states)
     bc = sub.add_parser("build-core",
                         help="clone+patch+build the Mesen2 core (MesenCore.so)")
     bc.add_argument("--dir", default=None, help="where to clone/build Mesen2")

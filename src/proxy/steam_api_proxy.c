@@ -1530,6 +1530,15 @@ static DWORD g_btn_a = 0x1000, g_btn_b = 0x4000, g_btn_select = 0x0200,
              g_btn_start = 0x0010, g_btn_up = 0x0001, g_btn_down = 0x0002,
              g_btn_left = 0x0004, g_btn_right = 0x0008;
 
+/* Mesen save-state hotkeys (combo masks). Defaults: LB+Y save, LB+B load.
+ * Both LB and Y/B are unused by the default NES mapping, so the combo is a
+ * pure hotkey. Configurable via `state_save_button` / `state_load_button`
+ * (e.g. "lb+y"); `state_slot` picks the slot. */
+static DWORD g_state_save_btn = 0x8100;  /* LB(0x100) | Y(0x8000) */
+static DWORD g_state_load_btn = 0x2100;  /* LB(0x100) | B(0x2000) */
+static int g_state_slot = 0;
+static DWORD g_state_prev = 0;
+
 static DWORD parse_button(const char *s)
 {
     if (!s || !s[0])
@@ -1554,8 +1563,20 @@ static DWORD parse_button(const char *s)
     return strtoul(s, NULL, 0);
 }
 
-static int g_xig_logs = 0;
+/* Parse a '+'-/','-separated button combo (e.g. "lb+y") into a mask. */
+static DWORD parse_button_combo(const char *s)
+{
+    char buf[64];
+    DWORD mask = 0;
+    if (!s || !s[0])
+        return 0;
+    snprintf(buf, sizeof(buf), "%s", s);
+    for (char *tok = strtok(buf, "+,"); tok; tok = strtok(NULL, "+,"))
+        mask |= parse_button(tok);
+    return mask;
+}
 
+static int g_xig_logs = 0;
 /* XInput wButtons -> NES $4016 bits (A=1,B=2,Select=4,Start=8,Up=16,Down=32,
  * Left=64,Right=128). */
 static uint32_t xinput_to_nes(unsigned int w)
@@ -1625,6 +1646,21 @@ static DWORD WINAPI hook_XInputGetState(DWORD idx, void *state)
             g_last_nes_btn = nes;
             g_last_nes_tick = GetTickCount();
             mesen_bridge_set_input(0, nes);
+        }
+        /* Save/load state hotkeys (rising edge on the combo). */
+        if (r == ERROR_SUCCESS && state) {
+            if (g_state_save_btn &&
+                (btn & g_state_save_btn) == g_state_save_btn) {
+                if ((g_state_prev & g_state_save_btn) != g_state_save_btn &&
+                    mesen_bridge_save_state((uint32_t)g_state_slot) == 0)
+                    log_line("[mmlc] state saved (slot %d)", g_state_slot);
+            } else if (g_state_load_btn &&
+                       (btn & g_state_load_btn) == g_state_load_btn) {
+                if ((g_state_prev & g_state_load_btn) != g_state_load_btn &&
+                    mesen_bridge_load_state((uint32_t)g_state_slot) == 0)
+                    log_line("[mmlc] state loaded (slot %d)", g_state_slot);
+            }
+            g_state_prev = btn;
         }
     }
     {
@@ -1995,6 +2031,23 @@ static DWORD WINAPI init_thread(LPVOID param)
             }
         }
     }
+    /* Mesen save-state hotkeys (state_save_button / state_load_button / state_slot). */
+    {
+        char v[64];
+        if (cfg_get(ini, "state_save_button", v, sizeof(v)) && v[0]) {
+            DWORD b = parse_button_combo(v);
+            if (b) g_state_save_btn = b;
+        }
+        if (cfg_get(ini, "state_load_button", v, sizeof(v)) && v[0]) {
+            DWORD b = parse_button_combo(v);
+            if (b) g_state_load_btn = b;
+        }
+        if (cfg_get(ini, "state_slot", v, sizeof(v)) && v[0])
+            g_state_slot = atoi(v);
+    }
+    log_line("[mmlc] state hotkeys: save=%#lx load=%#lx slot=%d",
+             (unsigned long)g_state_save_btn, (unsigned long)g_state_load_btn,
+             g_state_slot);
     g_skip_intro = cfg_flag(ini, "skip_intro", 1);
     if (g_skip_intro)
         install_intro_skip(target);
