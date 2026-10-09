@@ -17,6 +17,7 @@ Usage (all commands are terminal/CLI; no GUI required):
     20xx.py play [GAME] [opts]       # patch + start host + launch, from the CLI
     20xx.py launch [--print]         # launch the collection (or print the cmd)
     20xx.py mesen --core PATH        # enable the Mesen replacer (your core)
+    20xx.py unpack [--steamless P]   # Steamless-unpack Proteus.exe (Setup/Repair)
     20xx.py                          # interactive: pick a game, choose what to
                                      #   do (vanilla / rando / palette / ROM
                                      #   hack), then launch with Mesen
@@ -50,7 +51,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
-from mmlc import patcher, randomizer, romhack, romtable
+from mmlc import patcher, randomizer, romhack, romtable, steamless
 from mmlc.pe import PE, write_file_atomic
 
 DEFAULT_GAME_DIR = "/var/home/user/.local/share/Steam/steamapps/common/Suzy"
@@ -109,6 +110,115 @@ def find_source(game_dir: str, override: Optional[str] = None) -> str:
         if os.path.exists(p):
             return p
     raise SystemExit(f"20xx: no Proteus.exe(.orig.bak) in {game_dir}")
+
+
+# --- Steamless (SteamStub unpack) -------------------------------------------
+# The Mesen proxy's hooks are AOB-scanned in the *unpacked* .text. A clean Steam
+# install ships the SteamStub-packed Proteus.exe (extra `.bind` section, entry in
+# `.bind`), so every scan misses and 20XX does nothing. Setup/Repair unpacks it.
+PROTEUS_NAME = "Proteus.exe"
+PROTEUS_ORIG_BAK = "Proteus.exe.orig.bak"
+PROTEUS_PACKED_BAK = "Proteus.exe.packed.bak"
+STEAMSTUB_SECTION = ".bind"
+# `advance` (NESSystem vtable slot 5) prologue, VA 0x460750 in the unpacked exe.
+# Its presence proves .text is decrypted, i.e. the proxy's AOB scans will match.
+PROTEUS_ANCHOR = bytes.fromhex("568BF18B8E780D050081F9557400007D1D")
+
+
+def _section_names(path: str) -> List[str]:
+    try:
+        return [s.name for s in PE(path).sections]
+    except (OSError, ValueError):
+        return []
+
+
+def proteus_is_packed(path: str) -> bool:
+    """True if *path* is still SteamStub-packed (has a `.bind` section)."""
+    return STEAMSTUB_SECTION in _section_names(path)
+
+
+def proteus_is_unpacked(path: str) -> bool:
+    """True if *path* has a decrypted .text (the proxy's AOB anchor is present)."""
+    try:
+        with open(path, "rb") as fh:
+            return PROTEUS_ANCHOR in fh.read()
+    except OSError:
+        return False
+
+
+def _detect_steamless() -> Optional[str]:
+    """Return a Steamless.CLI.exe path if one is discoverable, else None."""
+    try:
+        return steamless.find_cli()
+    except steamless.SteamlessError:
+        return None
+
+
+def ensure_proteus_unpacked(game_dir: str, steamless_cli: Optional[str] = None,
+                            *, force: bool = False, status=print) -> bool:
+    """Unpack SteamStub-protected ``Proteus.exe`` so the proxy's runtime hooks
+    resolve. No-op when the exe is already unpacked.
+
+    Keeps ``Proteus.exe.orig.bak`` (the packed original, used for ROM
+    extraction) and ``Proteus.exe.packed.bak`` (restore point). Returns True on
+    success (including the already-unpacked case).
+    """
+    import shutil
+    exe = os.path.join(game_dir, PROTEUS_NAME)
+    if not os.path.exists(exe):
+        status(f"20xx: {exe} not found")
+        return False
+    if not force and not proteus_is_packed(exe):
+        if proteus_is_unpacked(exe):
+            status("[20xx] Proteus.exe is already unpacked")
+        else:
+            status("[20xx] Proteus.exe has no SteamStub `.bind` section; "
+                   "leaving as-is")
+        return True
+
+    orig_bak = os.path.join(game_dir, PROTEUS_ORIG_BAK)
+    if not os.path.exists(orig_bak):
+        shutil.copy2(exe, orig_bak)
+        status(f"[20xx] saved packed backup -> {os.path.basename(orig_bak)}")
+
+    packed_bak = os.path.join(game_dir, PROTEUS_PACKED_BAK)
+    shutil.copy2(exe, packed_bak)
+    stale = exe + ".unpacked.exe"
+    if os.path.exists(stale):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+    try:
+        cli = steamless.ensure_cli(steamless_cli, status=status)
+    except steamless.SteamlessError as ex:
+        status(f"20xx: Steamless unavailable: {ex}")
+        status("      pass --steamless PATH or set $STEAMLESS_CLI")
+        return False
+    status(f"[20xx] unpacking Proteus.exe with Steamless ...")
+    try:
+        steamless.unpack(exe, cli, out=exe)
+    except steamless.SteamlessError as ex:
+        status(f"20xx: Steamless failed: {ex}")
+        return False
+    except OSError as ex:
+        status(f"20xx: cannot replace {os.path.basename(exe)}: {ex}")
+        status("      close the game (and Steam's 'verify' dialog) and retry")
+        try:
+            shutil.copy2(packed_bak, exe)
+        except OSError:
+            pass
+        return False
+    if not proteus_is_unpacked(exe) or proteus_is_packed(exe):
+        status("20xx: Steamless output is not unpacked; restoring original")
+        try:
+            shutil.copy2(packed_bak, exe)
+        except OSError:
+            pass
+        return False
+    status(f"[20xx] unpacked Proteus.exe "
+           f"(packed backup: {os.path.basename(packed_bak)})")
+    return True
 
 
 def selected_games(game: Optional[str]) -> List[romtable.Game]:
@@ -555,12 +665,19 @@ def cmd_mesen(args: argparse.Namespace) -> int:
                     "menu_rb"])
     print(f"[20xx] Mesen replacer enabled (core={core}, port={port}).")
     if not args.no_install:
+        ensure_proteus_unpacked(gd, getattr(args, "steamless", None))
         install_proxy(gd)
     if args.start:
         start_host(core, port)
     else:
         print("  start the host with: 20xx mesen --core %s --start" % core)
     return 0
+
+
+def cmd_unpack(args: argparse.Namespace) -> int:
+    ok = ensure_proteus_unpacked(args.game_dir, args.steamless,
+                                 force=args.force)
+    return 0 if ok else 1
 
 
 def cmd_list(_: argparse.Namespace) -> int:
@@ -629,6 +746,7 @@ def ensure_mesen_host(game_dir: str) -> bool:
     if ini_get(game_dir, "mesen") != "1":
         print("[20xx] Mesen replacer is off; enable with: 20xx mesen --core PATH")
         return False
+    ensure_proteus_unpacked(game_dir, status=lambda m: print(m, flush=True))
     core = find_core(game_dir)
     if not core:
         print("[20xx] no Mesen core found; run: 20xx mesen --core /path/MesenCore.so")
@@ -867,6 +985,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
 
     game_dir = tk.StringVar(value=cfg.get("game_dir") or args.game_dir or game_dir_default())
     core = tk.StringVar(value=cfg.get("core") or "")
+    steamless_cli = tk.StringVar(value=cfg.get("steamless") or "")
     g0 = romtable.GAMES[GAME_ORDER[0]]
     game_label = tk.StringVar(value=f"{g0.title}  [{g0.region}]")
     mode = tk.StringVar(value=GUI_MODES[0])
@@ -893,6 +1012,25 @@ def cmd_gui(args: argparse.Namespace) -> int:
     ttk.Button(f1, text="Auto-detect",
                command=lambda: (game_dir.set(game_dir_default()), refresh_hacks())
                ).grid(row=0, column=2, padx=4)
+
+    ttk.Label(f1, text="Steamless.CLI.exe").grid(row=1, column=0, sticky="w",
+                                                 padx=6, pady=(0, 6))
+    ttk.Entry(f1, textvariable=steamless_cli).grid(row=2, column=0, sticky="ew",
+                                                   padx=6, pady=(0, 6))
+
+    def browse_steamless():
+        f = filedialog.askopenfilename(
+            initialdir=os.path.expanduser("~"),
+            title="Select Steamless.CLI.exe",
+            filetypes=[("Steamless CLI", "*.exe"), ("All files", "*")])
+        if f:
+            steamless_cli.set(f)
+
+    ttk.Button(f1, text="Browse",
+               command=browse_steamless).grid(row=2, column=1, padx=4, pady=(0, 6))
+    ttk.Button(f1, text="Auto-detect",
+               command=lambda: steamless_cli.set(_detect_steamless() or "")
+               ).grid(row=2, column=2, padx=4, pady=(0, 6))
 
     f2 = ttk.LabelFrame(root, text="2. Mesen core (user-supplied; GPLv3, not bundled)")
     f2.pack(fill="x", padx=10, pady=6)
@@ -1039,7 +1177,8 @@ def cmd_gui(args: argparse.Namespace) -> int:
         if gd:
             write_input_map(gd, m)
         c = dict(gui_config_load())
-        c.update({"game_dir": gd, "core": core.get().strip(), "input_map": m})
+        c.update({"game_dir": gd, "core": core.get().strip(),
+                  "steamless": steamless_cli.get().strip(), "input_map": m})
         gui_config_save(c)
         logq.put("[20xx] controls saved: "
                  + ", ".join(f"{k[4:]}={v}" for k, v in m.items()))
@@ -1050,6 +1189,8 @@ def cmd_gui(args: argparse.Namespace) -> int:
             logq.put("Set the install folder first.")
             return
         logq.put(f"[20xx] install: {gd}")
+        ensure_proteus_unpacked(gd, steamless_cli.get().strip() or None,
+                                status=lambda m: logq.put(m))
         src = find_source(gd)
         logq.put(f"[20xx] ROM source: {os.path.basename(src)}")
         install_proxy(gd)
@@ -1070,6 +1211,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
         logq.put(f"[20xx] extracted {len(written)} ROM(s) -> {os.path.join(gd, 'roms')}")
         c2 = dict(gui_config_load())
         c2.update({"game_dir": gd, "core": c,
+                   "steamless": steamless_cli.get().strip(),
                    "input_map": {k: v.get() for k, v in input_vars.items()}})
         gui_config_save(c2)
         logq.put("[20xx] setup complete.")
@@ -1346,7 +1488,16 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument("--off", action="store_true", help="disable the replacer")
     mp.add_argument("--no-install", action="store_true",
                     help="do not install the proxy DLL")
+    mp.add_argument("--steamless", default=None,
+                    help="path to Steamless.CLI.exe (for the SteamStub unpack)")
     mp.set_defaults(func=cmd_mesen)
+    up = sub.add_parser("unpack",
+                        help="Steamless-unpack Proteus.exe (required for the "
+                             "Mesen runtime hooks; also done by Setup/Repair)")
+    up.add_argument("--steamless", default=None, help="path to Steamless.CLI.exe")
+    up.add_argument("--force", action="store_true",
+                    help="re-unpack even if Proteus.exe is already unpacked")
+    up.set_defaults(func=cmd_unpack)
     bc = sub.add_parser("build-core",
                         help="clone+patch+build the Mesen2 core (MesenCore.so)")
     bc.add_argument("--dir", default=None, help="where to clone/build Mesen2")

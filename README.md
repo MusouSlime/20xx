@@ -41,6 +41,11 @@ bytes verbatim, which is exactly what a randomizer expects.
 
 - Steam **Mega Man Legacy Collection 1** installed (appid 363440).
 - **Python 3.9+** (stdlib only; `tkinter` for the GUI).
+- **Steamless v3.1.0.5** (`Steamless.CLI.exe`, runs under `mono`) — required so the
+  Mesen proxy's runtime hooks resolve. A clean Steam install ships the
+  SteamStub-packed `Proteus.exe`, which Setup/Repair unpacks. 20XX looks for the
+  CLI at `tools/steamless/Steamless.CLI.exe`, `~/.cache/mmlc-mesen/steamless/`,
+  `$STEAMLESS_CLI`, or a path you pass (`--steamless` / the GUI field).
 - For building the Mesen2 core: `git`, `make`, a C++ toolchain, and Mesen2's
   Linux build dependencies.
 - For building the proxy on Linux: `i686-w64-mingw32-gcc` (mingw-w64).
@@ -72,10 +77,13 @@ On Windows, apply the same patch and build `InteropDLL` (x64) from
 ## Install / use
 
 ```bash
-# point 20XX at a Mesen core (or run `20xx build-core` first)
+# unpack Proteus.exe (Steamless) + install the proxy, using a Mesen core
 20xx mesen --core /path/to/MesenCore.so
 
-# launch the GUI wizard (install folder, setup, options, launch)
+# re-unpack after a Steam update/repair replaces Proteus.exe
+20xx unpack --steamless /path/to/Steamless.CLI.exe
+
+# launch the GUI wizard (install folder, setup/repair, options, launch)
 20xx gui
 # or double-click the launcher:  ./20xx-gui.sh  (Linux)  20xx-gui.bat  (Windows)
 
@@ -85,6 +93,10 @@ On Windows, apply the same patch and build `InteropDLL` (x64) from
 20xx patch mm5 --seed hello  # MM2/MM3/MM5 weaknesses (upstream parity)
 20xx play mm1                # prepare + start the Mesen host + launch MMLC
 ```
+
+Setup/Repair (and every launch via the Mesen host) unpacks `Proteus.exe` with
+Steamless if it is still SteamStub-packed — a fresh install or Steam repair
+restores the packed exe, which otherwise disables all the runtime hooks.
 
 Steam pre-launch hook (Steam → Properties → Launch Options):
 
