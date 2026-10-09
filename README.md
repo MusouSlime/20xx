@@ -36,7 +36,8 @@ bytes verbatim, which is exactly what a randomizer expects.
 - **Export for other emulators:** `20xx export` writes the 12 ROMs (patched
   where selected) to `~/MMLC-ROMs` with friendly names, for use in any emulator.
 - **Save-state hotkeys** (Mesen mode): **LB+Y** saves, **LB+B** loads (slot 0).
-  Configurable via `20xx states --save-button ... --load-button ... --slot N`.
+  Set them in the GUI's **4. Controls** section (modifier + button + slot) or via
+  `20xx states --save-button ... --load-button ... --slot N`.
   Overclock follows MMLC's in-game **CPU SPEED** option; tune with `20xx overclock`.
 - **Launcher:** a terminal UI (`20xx`), a Tk GUI (`20xx gui`), and a Steam
   pre-launch hook (`20xx prelaunch %command%`).
