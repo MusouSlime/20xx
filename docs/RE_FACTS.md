@@ -305,3 +305,47 @@ tables inside `data.pie`; there is no separate menu binary format.
 - `steam_api.dll` in the install exposes **859 named exports** (mostly
   forwarders). A proxy DLL can re-export these to a renamed
   `steam_api_orig.dll` via a generated `.def`.
+
+## Mega Man sprite palette (offline PRG patch)
+
+The player-sprite palette is the vanilla light/dark blue pair, stored as 4-byte
+NES-palette entries `[light, dark, 0F, 0F]` (MM1 uses code immediates instead).
+Offsets are **PRG** (headerless) unless noted. Verified 2026-10-09 by reading the
+extracted `roms/*.nes`.
+
+| Game | Mega Man sprite palette | Notes |
+|---|---|---|
+| MM1 / RK1 | operands at the `MM1_PAL_OFFSETS` list + `MM1_PAL_BOSSROOM` | `a9 2C` / `a9 11` immediates |
+| MM2 / RK2 | entry @ PRG `0x3D30C` (`2C 11 0F 0F`) | slot 2 of the 9-entry table @ `0x3D304` |
+| MM3 / RK3 | entry @ PRG `0x4642` (`2C 11 0F 0F`) | immediately before `MM3_WEAPONPAL` (`0x4646`) |
+| MM4 / RK4 | entry @ PRG `0x73618` (`2C 11 0F 0F`) | **candidate**; other copies exist (`0x7363C`, `0x73B7F`, `0x368A7`, `0x36C4D`, `0x36C71`, `0x515A6`) — confirm in-game |
+| MM5 / RK5 | entry #1 @ PRG `0x253C` (`2C 11 0F 0F`) | second of the 21-entry table @ `0x2538` |
+| MM6 / RK6 | **not located** | palettes are compressed (no plain `2C 11 0F 0F`); `2C 11` sits inside packed data (`0x51227`, `0x6F227`, …) |
+
+JP parity: RK1–RK5 share the *same* palette-data offsets as their US counterparts
+(the `2C 11 0F 0F` tables are byte-identical in location for MM1/RK1, MM2/RK2,
+MM3/RK3, MM5/RK5). So a US-targeted palette patch covers the JP ROMs for those
+five; only MM4's copies shift slightly and MM6 is unresolved.
+
+## MM6 damage table (randomizer) — status: not located
+
+The standalone `Mega Man 6 (USA).nes` is byte-identical to the MMLC-extracted
+`mm6.nes` except **18 bytes** around PRG `0x7968C–0x7969F` (a sanitized text
+region), so any offset found in one applies to the other.
+
+RAM facts (Data Crystal): boss HP `$03ED`, current weapon `$0699`, and weapon
+energy `$0688`..`$0691` in the order **buster, Yamato, Wind, Blizzard, Fire,
+Plant, Knight, Silver, Centaur, Beat** (indices 0–9).
+
+Code found by AOB search in the flat PRG:
+- boss HP init @ `0x7623F`: `$03ED = $03EE + $03EF + 1`.
+- boss-defeat/health-bar routine @ `0x7EF29` (sets `$03ED=0xFF`, fills to `0x1B`).
+- weapon-index reads (`LDA $0699`) @ `0x7058F`, `0x705F2` (`+0x80` then table).
+
+Data-mining did **not** find the damage table as a contiguous boss-major or
+weapon-major matrix: every boss order permutation was tried for the 8×8 chart
+(contiguous per-weapon rows, per-boss rows, and 8-record blocks) with no match.
+So MM6 likely stores per-weapon damage tables indexed by object id (MM4-style),
+or computes damage in code. Next step: disassemble the projectile→boss hit
+handler around the `$03ED` references (`0x622EA`, `0x62F99`, `0x6382C`,
+`0x63851`, `0x63C22`) with a 6502 disassembler / Ghidra+Bisqwit-style disassembly.
