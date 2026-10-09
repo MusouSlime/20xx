@@ -199,6 +199,12 @@ Note: `pkill -f "mesen_host --core"` matches its own shell — use `pkill -x mes
 6. **Randomizer removed from the engine; Museum restored.** `data.pie` reverted to
    the vanilla archive; the in-engine menu/randomizer code is gone. Patching now
    lives in 20xx (offline): `--seed` randomizer + palette + IPS/BPS ROM hacks.
+   Offline randomizers now exist for **MM1, MM2, MM3, MM4, MM5**
+   (`RANDO_GAMES`): weakness + reward + palette. MM2/MM3/MM5 boss weaknesses
+   and MM5's weapon-get reward are byte-for-byte ports of the upstream
+   randomizers (verified against them); MM4 and the other reward/palette paths
+   are 20xx shuffles. MM6 is not yet randomized (its damage/reward tables are
+   not yet located).
 7. **Intro skip — implemented.** `skip_intro=1` patches `anyButtonPressed`
    (`0x43cc70`, single caller) to return 1, skipping the photosensitivity
    warning/logo splash without touching input state.

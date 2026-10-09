@@ -12,7 +12,7 @@
 | 0 Environment/safety | **done** | Steamless wrapper, PE reader, backup/restore, canary CRCs, tests |
 | 1 Runtime injection | **done (MVP)** | proxy forwards 859 exports, NOPs overlay, AOB-scans virtuals, and hooks `FUN_0045c220` to inject a same-size ROM over `[this+0x810]`+`[this+0x81C]` |
 | 2 Asset/data.pie | **partial** | `data.pie` extract/update/repack + locale/db editors done; **open**: loose-file override vs pack |
-| 3 Randomizer | **MM1 in-engine** | proxy randomizes MM1 at load (seed from `mmlc.ini`), applies the weakness visualizer; C/Python RNG parity verified; MM2+ pending |
+| 3 Randomizer | **MM1, MM2, MM3, MM4, MM5 offline** | 20xx patches offline (`--seed`). MM1 full; MM2/MM3/MM5 weakness + reward + palette (MM2/MM3/MM5 weaknesses and MM5 weapon-get are byte-for-byte upstream ports); MM4 full (own shuffles). MM6 pending |
 | 4 Custom menus | **partial** | Museum/Database/locale editing done; challenge entries pending |
 | 5 Archipelago | not started | |
 | 6 Mesen core | deferred | |

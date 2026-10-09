@@ -23,11 +23,11 @@ Usage (all commands are terminal/CLI; no GUI required):
 
 Patch options (for `patch` and `play`):
     --seed S            randomizer seed ('random' for a fresh one)
-    --[no-]weakness     shuffle boss weaknesses        (MM1)
-    --[no-]weapons      shuffle weapon rewards         (MM1)
-    --[no-]palette      shuffle Mega Man's palette     (MM1)
+    --[no-]weakness     shuffle boss weaknesses        (MM1/MM2/MM3/MM4/MM5)
+    --[no-]weapons      shuffle weapon rewards         (MM1/MM2/MM3/MM4/MM5)
+    --[no-]palette      shuffle Mega Man's palette     (MM1/MM2/MM3/MM4/MM5)
     --palette-only      palette shuffle only
-    --visualizer        apply the weakness-visualizer IPS
+    --visualizer        apply the weakness-visualizer IPS (MM1)
     --romhack FILE      apply an IPS/BPS ROM hack (repeatable)
     --ips-adjust N      add N to IPS offsets (-16 = headerless patch)
 
@@ -140,8 +140,11 @@ def extract(game_dir: str, out_dir: str, game: Optional[str] = None,
 
 # --- offline patching (randomizer / palette / ROM hacks) --------------------
 
-# Games with an offline randomizer (MM1 first; more to come).
-RANDO_GAMES = {"mm1"}
+# Games with an offline randomizer: MM1 (weakness/rewards/palette);
+# MM2/MM3/MM5 (weakness + reward + palette, MM2/MM3/MM5 weaknesses and the MM5
+# weapon-get reward are byte-for-byte ports of the upstream tools); MM4
+# (weakness + reward + palette, own deterministic shuffles).
+RANDO_GAMES = {"mm1", "mm2", "mm3", "mm4", "mm5"}
 
 
 def random_seed(length: int = 5) -> str:
@@ -191,7 +194,7 @@ def build_patched_nes(game: romtable.Game, pe: PE, *,
                       visualizer: bool = False,
                       romhacks: Optional[List[str]] = None,
                       ips_adjust: int = 0) -> bytes:
-    """Return a patched iNES image: randomizer/palette (MM1) + ROM hacks.
+    """Return a patched iNES image: randomizer/palette (per game) + ROM hacks.
 
     The PRG is randomized first, then ROM-hack patches are applied to the whole
     .nes (so a hack sees the final tables). BPS hacks may resize the image."""
@@ -203,8 +206,8 @@ def build_patched_nes(game: romtable.Game, pe: PE, *,
             print(f"20xx: no randomizer for {game.key} yet; ignoring --seed")
         else:
             prg = bytearray(nes[prg_off:prg_off + prg_size])
-            spoiler = randomizer.randomize_mm1(
-                prg, seed, weakness=weakness, weapons=weapons,
+            spoiler = randomizer.randomize(
+                game.key, prg, seed, weakness=weakness, weapons=weapons,
                 visualizer=visualizer, palette=palette)
             nes[prg_off:prg_off + prg_size] = prg
             print(f"20xx: randomized {game.key} seed={seed!r} "
@@ -1279,11 +1282,11 @@ def _add_patch_opts(sp: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     help="randomizer seed ('random' for a fresh one); "
                          "omit for vanilla")
     sp.add_argument("--weakness", action=argparse.BooleanOptionalAction,
-                    default=True, help="shuffle boss weaknesses (MM1)")
+                    default=True, help="shuffle boss weaknesses (MM1/MM2/MM3/MM4/MM5)")
     sp.add_argument("--weapons", action=argparse.BooleanOptionalAction,
-                    default=True, help="shuffle weapon rewards (MM1)")
+                    default=True, help="shuffle weapon rewards (MM1/MM2/MM3/MM4/MM5)")
     sp.add_argument("--palette", action=argparse.BooleanOptionalAction,
-                    default=True, help="shuffle Mega Man's palette (MM1)")
+                    default=True, help="shuffle palettes (MM1/MM2/MM3/MM4/MM5)")
     sp.add_argument("--palette-only", action="store_true",
                     help="only shuffle the palette (seed implied)")
     sp.add_argument("--visualizer", action="store_true",

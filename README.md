@@ -25,9 +25,11 @@ bytes verbatim, which is exactly what a randomizer expects.
 - **Runs all 12 ROMs through Mesen2**, synced frame-by-frame into the engine's
   own 1024×960 screen buffer, with audio bridged out and controller input
   forwarded both ways.
-- **Offline randomizer (MM1 first):** boss-weakness shuffle, weapon-reward
-  shuffle, palette shuffle, and the weakness visualizer — deterministic per
-  seed and byte-for-byte reproducible.
+- **Offline randomizer (MM1, MM2, MM3, MM4, MM5):** boss-weakness shuffle
+  (MM2/MM3/MM5 are byte-for-byte ports of the upstream community randomizers,
+  as is MM5's weapon-get reward), weapon-reward shuffle and palette shuffle for
+  all five. Deterministic per seed and reproducible offline. MM6 is not yet
+  randomized.
 - **Drop-in ROM-hack folder:** put `.ips`/`.bps` patches under
   `romhacks/<game>/` and 20XX applies them when it patches the ROM.
 - **Launcher:** a terminal UI (`20xx`), a Tk GUI (`20xx gui`), and a Steam
@@ -80,6 +82,7 @@ On Windows, apply the same patch and build `InteropDLL` (x64) from
 # or drive it from the terminal
 20xx extract                 # write roms/*.nes from your own Proteus.exe
 20xx patch mm1 --seed hello  # randomize MM1 (offline)
+20xx patch mm5 --seed hello  # MM2/MM3/MM5 weaknesses (upstream parity)
 20xx play mm1                # prepare + start the Mesen host + launch MMLC
 ```
 
