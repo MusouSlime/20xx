@@ -151,6 +151,9 @@ jobs:
       - name: Checksums
         run: |
           cd artifacts
+          # mesen_host.exe is an intermediate build artifact passed between
+          # jobs; it is bundled inside the AppImage/exe, not a download.
+          rm -f mesen_host.exe
           sha256sum * > SHA256SUMS
           cat SHA256SUMS
 
