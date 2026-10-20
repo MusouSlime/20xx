@@ -101,7 +101,7 @@ DEFAULT_APPID = "363440"
 
 # Brand/version shown so it is obvious which build is running.
 APP = "20XX"
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # --- Mesen replacer (optional; the user supplies their own Mesen2 core) ------
 HOST_SRC = os.path.join(BUNDLE, "tools", "mesen_host", "mesen_host.c")
