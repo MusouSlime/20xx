@@ -52,8 +52,9 @@ bytes verbatim, which is exactly what a randomizer expects.
 ## Requirements
 
 - Steam **Mega Man Legacy Collection 1** installed (appid 363440).
-- **Python 3.9+** (stdlib only; `tkinter` for the GUI) when running from a
-  source checkout. The prebuilt AppImage/exe bundle Python and Tk.
+- **Python 3.9+** (stdlib plus `cryptography` for the `data.pie` editor
+  tools; `tkinter` for the GUI) when running from a source checkout. The
+  prebuilt AppImage/exe bundle Python, Tk and the launcher's dependencies.
 - **Steamless v3.1.0.5** (`Steamless.CLI.exe`, runs under `mono`) — required so the
   Mesen proxy's runtime hooks resolve. A clean Steam install ships the
   SteamStub-packed `Proteus.exe`, which Setup/Repair unpacks. 20XX looks for the
