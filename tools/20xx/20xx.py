@@ -952,6 +952,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 "installed" if proxy_ok else "not installed (20xx setup)",
                 warn=not proxy_ok)
 
+    if install_ok:
+        _, dpad_bad = normalize_input_map(read_input_map(gd))
+        _check_line("D-pad mapping", not dpad_bad,
+                    "ok" if not dpad_bad else
+                    "duplicate directions (run: 20xx setup)", warn=True)
+
     core = find_core(gd, getattr(args, "core", None))
     core_ok = False
     if core:
@@ -1022,6 +1028,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
         return 1
     print(f"[20xx] install: {gd}")
     print(f"[20xx] ROM source: {os.path.basename(src)}")
+
+    if repair_input_map(gd):
+        print("[20xx] repaired a duplicate D-pad mapping in mmlc.ini")
 
     unpack_ok = ensure_proteus_unpacked(gd, getattr(args, "steamless", None),
                                         status=lambda m: print(m, flush=True))
@@ -1549,9 +1558,46 @@ def join_state_combo(mod: str, btn: str) -> str:
     return f"{mod}+{btn}" if mod else btn
 
 
+DPAD_DIRECTIONS = ("btn_up", "btn_down", "btn_left", "btn_right")
+
+
+def normalize_input_map(mapping: dict):
+    """Return (map, repaired).
+
+    A duplicated D-pad direction is always a misconfiguration (e.g. Up and
+    Left both bound to ``dpad_left``), so repair those four to the defaults.
+    Other bindings are preserved, including intentional face-button choices.
+    """
+    m = dict(DEFAULT_INPUT_MAP)
+    for k in INPUT_LABELS:
+        v = (mapping or {}).get(k)
+        if v:
+            m[k] = str(v)
+    directions = [m[k] for k in DPAD_DIRECTIONS]
+    if len(set(directions)) != len(directions):
+        for k in DPAD_DIRECTIONS:
+            m[k] = DEFAULT_INPUT_MAP[k]
+        return m, True
+    return m, False
+
+
+def read_input_map(game_dir: str) -> dict:
+    return {k: ini_get(game_dir, k) or DEFAULT_INPUT_MAP[k]
+            for k in INPUT_LABELS}
+
+
 def write_input_map(game_dir: str, mapping: dict) -> None:
     """Persist btn_* values into mmlc.ini (the proxy reads them at load)."""
-    ini_set(game_dir, {k: v for k, v in mapping.items() if v})
+    fixed, _ = normalize_input_map(mapping)
+    ini_set(game_dir, fixed)
+
+
+def repair_input_map(game_dir: str) -> bool:
+    """Rewrite mmlc.ini if its D-pad directions collide. Returns True if fixed."""
+    fixed, changed = normalize_input_map(read_input_map(game_dir))
+    if changed:
+        write_input_map(game_dir, fixed)
+    return changed
 
 
 def gui_config_path() -> str:
@@ -1749,6 +1795,15 @@ def cmd_gui(args: argparse.Namespace) -> int:
         active.set(c["id"])
         game_dir.set(c["game_dir"])
         save_config()
+
+    def input_map_values() -> dict:
+        m, repaired = normalize_input_map(
+            {k: v.get() for k, v in input_vars.items()})
+        if repaired:
+            for k, v in m.items():
+                input_vars[k].set(v)
+            logq.put("[20xx] duplicate D-pad directions reset to defaults")
+        return m
 
     # --- Collection page ----------------------------------------------------
     def show_collections():
@@ -2271,7 +2326,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
         gd = game_dir.get().strip()
         if not gd:
             return
-        write_input_map(gd, {k: v.get() for k, v in input_vars.items()})
+        write_input_map(gd, input_map_values())
         ini_set(gd, {"state_save_button": join_state_combo(save_mod.get(), save_btn.get()),
                      "state_load_button": join_state_combo(load_mod.get(), load_btn.get()),
                      "state_reset_button": join_state_combo(reset_mod.get(), reset_btn.get()),
@@ -2293,7 +2348,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
         open_folder(p)
 
     def save_controls():
-        m = {k: v.get() for k, v in input_vars.items()}
+        m = input_map_values()
         gd = game_dir.get().strip()
         sv = join_state_combo(save_mod.get(), save_btn.get())
         ld = join_state_combo(load_mod.get(), load_btn.get())
@@ -2344,7 +2399,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
         logq.put(f"[20xx] overclock: follow in-game CPU SPEED="
                  f"{oc_follow.get()} turbo={turbo} scanlines")
         logq.put(f"[20xx] romhacks folder: {ensure_romhacks_dir(gd)}")
-        write_input_map(gd, {k: v.get() for k, v in input_vars.items()})
+        write_input_map(gd, input_map_values())
         sv = join_state_combo(save_mod.get(), save_btn.get())
         ld = join_state_combo(load_mod.get(), load_btn.get())
         rs = join_state_combo(reset_mod.get(), reset_btn.get())

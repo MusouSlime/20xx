@@ -42,6 +42,32 @@ class SetupFlowTests(unittest.TestCase):
             self.assertFalse(X.install_proxy(d))
             self.assertFalse(os.path.exists(os.path.join(d, "steam_api.dll")))
 
+    def test_duplicate_dpad_is_repaired(self):
+        m = dict(X.DEFAULT_INPUT_MAP)
+        m["btn_up"] = "dpad_left"          # the bad value seen in the wild
+        fixed, repaired = X.normalize_input_map(m)
+        self.assertTrue(repaired)
+        for k in X.DPAD_DIRECTIONS:
+            self.assertEqual(fixed[k], X.DEFAULT_INPUT_MAP[k])
+
+    def test_custom_dpad_is_preserved(self):
+        m = dict(X.DEFAULT_INPUT_MAP)
+        m.update(btn_up="y", btn_down="a", btn_left="x", btn_right="b")
+        fixed, repaired = X.normalize_input_map(m)
+        self.assertFalse(repaired)
+        self.assertEqual(fixed["btn_up"], "y")
+        self.assertEqual(fixed["btn_left"], "x")
+
+    def test_repair_input_map_rewrites_ini(self):
+        with tempfile.TemporaryDirectory() as d:
+            X.ini_set(d, {"btn_up": "dpad_left", "btn_left": "dpad_left",
+                          "btn_a": "b"})
+            self.assertTrue(X.repair_input_map(d))
+            self.assertEqual(X.ini_get(d, "btn_up"), "dpad_up")
+            self.assertEqual(X.ini_get(d, "btn_left"), "dpad_left")
+            self.assertEqual(X.ini_get(d, "btn_a"), "b")
+            self.assertFalse(X.repair_input_map(d))
+
     def test_setup_env_detection_does_not_crash(self):
         self.assertTrue(isinstance(X.game_dir_default(), str))
 
