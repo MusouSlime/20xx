@@ -1530,14 +1530,19 @@ static DWORD g_btn_a = 0x1000, g_btn_b = 0x4000, g_btn_select = 0x0200,
              g_btn_start = 0x0010, g_btn_up = 0x0001, g_btn_down = 0x0002,
              g_btn_left = 0x0004, g_btn_right = 0x0008;
 
-/* Mesen hotkey combos. Defaults: LB+Y save, LB+B load, LB+X reset (soft reset;
- * Mesen auto-loads its state on reset). LB/Y/B/X are unused by the default NES
- * mapping, so the combos are pure hotkeys. Configurable via
- * `state_save_button` / `state_load_button` / `state_reset_button`
- * (e.g. "lb+y"); `state_slot` picks the save slot. */
+/* Mesen hotkey combos. Defaults: LB+Y save, LB+B load, LB+Start reset (soft
+ * reset; Mesen auto-loads its state on reset), LB+X turbo (hold to fast
+ * forward). LB/Y/B/X/Start are otherwise unused by the default NES mapping,
+ * so the combos are pure hotkeys. Configurable via
+ * `state_save_button` / `state_load_button` / `state_reset_button` /
+ * `state_turbo_button` (e.g. "lb+y"); `state_slot` picks the save slot and
+ * `state_turbo_speed` the turbo speed percent. */
 static DWORD g_state_save_btn = 0x8100;  /* LB(0x100) | Y(0x8000) */
 static DWORD g_state_load_btn = 0x2100;  /* LB(0x100) | B(0x2000) */
-static DWORD g_state_reset_btn = 0x4100; /* LB(0x100) | X(0x4000) */
+static DWORD g_state_reset_btn = 0x0110; /* LB(0x100) | Start(0x0010) */
+static DWORD g_state_turbo_btn = 0x4100; /* LB(0x100) | X(0x4000) */
+static int g_turbo_percent = 200;
+static int g_turbo_active = 0;
 static int g_state_slot = 0;
 static DWORD g_state_prev = 0;
 
@@ -1649,8 +1654,22 @@ static DWORD WINAPI hook_XInputGetState(DWORD idx, void *state)
             g_last_nes_tick = GetTickCount();
             mesen_bridge_set_input(0, nes);
         }
-        /* Save/load/reset hotkeys (rising edge on the combo). */
+        /* Save/load/reset/turbo hotkeys. Turbo is a hold (fast-forward while
+         * the combo is down); the rest fire on the rising edge. */
         if (r == ERROR_SUCCESS && state) {
+            if (g_state_turbo_btn) {
+                int held = (btn & g_state_turbo_btn) == g_state_turbo_btn;
+                if (held && !g_turbo_active) {
+                    if (mesen_bridge_set_speed((uint32_t)g_turbo_percent) == 0) {
+                        g_turbo_active = 1;
+                        log_line("[mmlc] turbo on (%d%%)", g_turbo_percent);
+                    }
+                } else if (!held && g_turbo_active) {
+                    mesen_bridge_set_speed(100);
+                    g_turbo_active = 0;
+                    log_line("[mmlc] turbo off");
+                }
+            }
             if (g_state_save_btn &&
                 (btn & g_state_save_btn) == g_state_save_btn) {
                 if ((g_state_prev & g_state_save_btn) != g_state_save_btn &&
@@ -2053,12 +2072,19 @@ static DWORD WINAPI init_thread(LPVOID param)
             DWORD b = parse_button_combo(v);
             if (b) g_state_reset_btn = b;
         }
+        if (cfg_get(ini, "state_turbo_button", v, sizeof(v)) && v[0]) {
+            DWORD b = parse_button_combo(v);
+            if (b) g_state_turbo_btn = b;
+        }
+        if (cfg_get(ini, "state_turbo_speed", v, sizeof(v)) && v[0])
+            g_turbo_percent = atoi(v);
         if (cfg_get(ini, "state_slot", v, sizeof(v)) && v[0])
             g_state_slot = atoi(v);
     }
-    log_line("[mmlc] state hotkeys: save=%#lx load=%#lx reset=%#lx slot=%d",
+    log_line("[mmlc] state hotkeys: save=%#lx load=%#lx reset=%#lx turbo=%#lx(%d%%) slot=%d",
              (unsigned long)g_state_save_btn, (unsigned long)g_state_load_btn,
-             (unsigned long)g_state_reset_btn, g_state_slot);
+             (unsigned long)g_state_reset_btn, (unsigned long)g_state_turbo_btn,
+             g_turbo_percent, g_state_slot);
     g_skip_intro = cfg_flag(ini, "skip_intro", 1);
     if (g_skip_intro)
         install_intro_skip(target);

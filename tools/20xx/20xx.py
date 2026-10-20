@@ -30,7 +30,11 @@ Patch options (for `patch` and `play`):
     --[no-]weapons      shuffle weapon rewards         (MM1/MM2/MM3/MM4/MM5)
     --[no-]palette      shuffle Mega Man's palette     (MM1/MM2/MM3/MM4/MM5)
     --palette-only      palette shuffle only
-    --visualizer        apply the weakness-visualizer IPS (MM1)
+    --[no-]visualizer   stage-select colors + green marker (MM1, default on)
+    --victory-lap       max out all MM1 boss damage (easy kills)
+    --door-palette      tint each MM1 boss door with its weakness color
+    --vanilla-wily      keep the MM1 Wily-stage damage rows vanilla
+    --cursor-tint       tint the selected stage-select portrait (MM1)
     --romhack FILE      apply an IPS/BPS ROM hack (repeatable)
     --ips-adjust N      add N to IPS offsets (-16 = headerless patch)
 
@@ -53,7 +57,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
-from mmlc import patcher, randomizer, romhack, romtable, steamless
+from mmlc import hardmode, patcher, randomizer, romhack, romtable, steamless, wily
 from mmlc.pe import PE, write_file_atomic
 
 DEFAULT_GAME_DIR = "/var/home/user/.local/share/Steam/steamapps/common/Suzy"
@@ -305,12 +309,20 @@ def build_patched_nes(game: romtable.Game, pe: PE, *,
                       weapons: bool = True,
                       palette: bool = True,
                       visualizer: bool = False,
+                      victory_lap: bool = False,
+                      door_palette: bool = False,
+                      vanilla_wily: bool = False,
+                      cursor_tint: bool = False,
+                      hard_mode: bool = False,
+                      ohko: bool = False,
                       romhacks: Optional[List[str]] = None,
                       ips_adjust: int = 0) -> bytes:
     """Return a patched iNES image: randomizer/palette (per game) + ROM hacks.
 
-    The PRG is randomized first, then ROM-hack patches are applied to the whole
-    .nes (so a hack sees the final tables). BPS hacks may resize the image."""
+    The PRG is randomized first, then the MM1 Wily patches (victory lap /
+    door palette, which read the final damage charts), then ROM-hack patches
+    are applied to the whole .nes (so a hack sees the final tables). BPS
+    hacks may resize the image."""
     nes = bytearray(patcher.extract_ines(pe, game))
     prg_off, prg_size = 16, game.prg.size
 
@@ -319,15 +331,61 @@ def build_patched_nes(game: romtable.Game, pe: PE, *,
             print(f"20xx: no randomizer for {game.key} yet; ignoring --seed")
         else:
             prg = bytearray(nes[prg_off:prg_off + prg_size])
-            spoiler = randomizer.randomize(
-                game.key, prg, seed, weakness=weakness, weapons=weapons,
-                visualizer=visualizer, palette=palette)
+            rkw = dict(weakness=weakness, weapons=weapons,
+                       visualizer=visualizer, palette=palette)
+            if game.key == "mm1":
+                rkw["cursor_tint"] = cursor_tint
+            spoiler = randomizer.randomize(game.key, prg, seed, **rkw)
             nes[prg_off:prg_off + prg_size] = prg
             print(f"20xx: randomized {game.key} seed={seed!r} "
                   f"weakness={weakness} weapons={weapons} palette={palette} "
                   f"visualizer={visualizer}")
             for line in spoiler.lines()[1:]:
                 print("   " + line)
+    elif game.key == "mm1" and cursor_tint:
+        # Standalone hook on vanilla charts (no randomizer run): no
+        # visualizer routine, so record the top-buster index for the
+        # hook's runtime green check the same way randomize_mm1 does.
+        prg = bytearray(nes[prg_off:prg_off + prg_size])
+        charts = [list(prg[randomizer.MM1_DAMAGE_TABLE + b * 8:
+                           randomizer.MM1_DAMAGE_TABLE + b * 8 + 8])
+                  for b in range(6)]
+        prg[randomizer.MM1_GREEN_BOSS] = max(
+            range(6), key=lambda b: charts[b][0])
+        randomizer.apply_cursor_hook(prg, charts)
+        nes[prg_off:prg_off + prg_size] = prg
+        print("20xx: installed mm1 cursor tint hook (vanilla charts)")
+
+    hook = game.key == "mm1" and (
+        cursor_tint or (seed is not None and visualizer))
+    if game.key == "mm1" and (victory_lap or door_palette or vanilla_wily
+                              or hard_mode or ohko):
+        prg = bytearray(nes[prg_off:prg_off + prg_size])
+        if victory_lap or door_palette or vanilla_wily:
+            wily.apply_patches(prg, wily.WilyPatchConfig(
+                victory_lap=victory_lap, colored_doors=door_palette,
+                vanilla_wily=vanilla_wily))
+            print(f"20xx: wily patches mm1 victory_lap={victory_lap} "
+                  f"door_palette={door_palette} vanilla_wily={vanilla_wily}")
+        if ohko:
+            # OHKO wins over hard mode; applied after the randomizer so the
+            # visualizer/doors/tint (computed pre-OHKO) stay meaningful.
+            hardmode.apply_ohko(prg)
+            print("20xx: mm1 OHKO mode (any hit = instant death)")
+        elif hard_mode:
+            # Scale the final damage tables (after the randomizer/victory
+            # lap) so it applies "no matter what mode"; preserves argmax,
+            # so the weakness colors stay correct.
+            hardmode.apply_hard_mode(prg)
+            print("20xx: mm1 hard mode (damage received x2, dealt /1.5)")
+        if hook and not ohko:
+            # victory lap / hard mode rewrite the damage charts after the
+            # cursor hook was installed; refresh its weakness table
+            # (+ $FF43) from the final charts (no-op rewrite otherwise).
+            # OHKO flattens the charts, so skip it and keep the pre-OHKO
+            # weakness colors.
+            randomizer.refresh_cursor_hook(prg)
+        nes[prg_off:prg_off + prg_size] = prg
 
     for path in (romhacks or []):
         with open(path, "rb") as fh:
@@ -342,6 +400,9 @@ def patch_game(game_dir: str, out_dir: str, game_key: str, *,
                source: Optional[str] = None, seed: Optional[str] = None,
                weakness: bool = True, weapons: bool = True,
                palette: bool = True, visualizer: bool = False,
+               victory_lap: bool = False, door_palette: bool = False,
+               vanilla_wily: bool = False, cursor_tint: bool = False,
+               hard_mode: bool = False, ohko: bool = False,
                romhacks: Optional[List[str]] = None,
                ips_adjust: int = 0, auto_romhacks: bool = True) -> str:
     src = find_source(game_dir, source)
@@ -353,7 +414,10 @@ def patch_game(game_dir: str, out_dir: str, game_key: str, *,
         hacks = discover_romhacks(game_dir, g.key) + hacks
     data = build_patched_nes(g, pe, seed=seed, weakness=weakness,
                              weapons=weapons, palette=palette,
-                             visualizer=visualizer, romhacks=hacks,
+                             visualizer=visualizer, victory_lap=victory_lap,
+                             door_palette=door_palette, vanilla_wily=vanilla_wily,
+                             cursor_tint=cursor_tint, hard_mode=hard_mode,
+                             ohko=ohko, romhacks=hacks,
                              ips_adjust=ips_adjust)
     out = os.path.join(out_dir, f"{g.key}.nes")
     write_file_atomic(out, data)
@@ -374,6 +438,10 @@ def _apply_palette_only(args: argparse.Namespace) -> None:
     if args.palette_only:
         args.weakness = args.weapons = False
         args.palette = True
+        # "palette only" means exactly that: don't let the now-default-on
+        # visualizer (and its green/cursor-tint extras) sneak in, matching
+        # the GUI's "Palette shuffle only" mode.
+        args.visualizer = False
 
 
 def verify(game_dir: str, source: Optional[str] = None) -> int:
@@ -715,7 +783,8 @@ def cmd_overclock(args: argparse.Namespace) -> int:
 
 def cmd_states(args: argparse.Namespace) -> int:
     """Configure the Mesen save/load-state and reset hotkeys (handy for
-    ROM-hack testing). Defaults: LB+Y save, LB+B load, LB+X reset, slot 0."""
+    ROM-hack testing). Defaults: LB+Y save, LB+B load, LB+Start reset,
+    LB+X turbo (hold), slot 0."""
     gd = args.game_dir
     vals: Dict[str, str] = {}
     off = {"off", "none", ""}
@@ -729,13 +798,15 @@ def cmd_states(args: argparse.Namespace) -> int:
         vals["state_load_button"] = combo(args.load_button)
     if args.reset_button is not None:
         vals["state_reset_button"] = combo(args.reset_button)
+    if getattr(args, "turbo_button", None) is not None:
+        vals["state_turbo_button"] = combo(args.turbo_button)
     if args.slot is not None:
         vals["state_slot"] = str(args.slot)
     if vals:
         ini_set(gd, vals)
     print("[20xx] save-state hotkeys (restart the game to apply):")
     for k in ("state_save_button", "state_load_button", "state_reset_button",
-              "state_slot"):
+              "state_turbo_button", "state_slot"):
         print(f"  {k} = {ini_get(gd, k) or '(default)'}")
     return 0
 
@@ -774,27 +845,49 @@ def cmd_launch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _split_targets(target) -> "set[str]":
+    """Normalize a target spec to a set of game keys.
+
+    Accepts ``"all"``, a single key (``"mm1"``), a comma/space list
+    (``"mm1,rk1"``) or an iterable of keys. Used by ``prepare_roms`` /
+    ``export_roms`` so a tab can patch a US/JP pair in one pass.
+    """
+    if isinstance(target, (set, list, tuple, frozenset)):
+        keys = {str(t).strip() for t in target if str(t).strip()}
+    else:
+        keys = {t for t in str(target or "all").replace(",", " ").split() if t}
+    return keys or {"all"}
+
+
 def prepare_roms(game_dir: str, out: str, *, source: Optional[str] = None,
-                 target: str = "all", seed: Optional[str] = None,
+                 target="all", seed: Optional[str] = None,
                  weakness: bool = True, weapons: bool = True,
                  palette: bool = True, visualizer: bool = False,
+                 victory_lap: bool = False, door_palette: bool = False,
+                 vanilla_wily: bool = False, cursor_tint: bool = False,
+                 hard_mode: bool = False, ohko: bool = False,
                  romhacks: Optional[List[str]] = None,
                  ips_adjust: int = 0, auto_romhacks: bool = True) -> None:
-    """Patch `target` (a game key, or 'all') with the options and write every
-    game's .nes (vanilla for the rest) so any pick in the collection works."""
+    """Patch `target` (a game key, a comma list like ``"mm1,rk1"``, or
+    'all') with the options and write every game's .nes (vanilla for the
+    rest) so any pick in the collection works."""
+    targets = _split_targets(target)
     src = find_source(game_dir, source)
     pe = PE(src)
     os.makedirs(out, exist_ok=True)
     for k in GAME_ORDER:
         g = romtable.GAMES[k]
         opts = {}
-        if target in ("all", k):
+        if "all" in targets or k in targets:
             hacks = list(romhacks or [])
             if auto_romhacks:
                 hacks = discover_romhacks(game_dir, k) + hacks
             opts = dict(seed=(seed if k in RANDO_GAMES else None),
                         weakness=weakness, weapons=weapons, palette=palette,
-                        visualizer=visualizer, romhacks=hacks,
+                        visualizer=visualizer, victory_lap=victory_lap,
+                        door_palette=door_palette, vanilla_wily=vanilla_wily,
+                        cursor_tint=cursor_tint, hard_mode=hard_mode,
+                        ohko=ohko, romhacks=hacks,
                         ips_adjust=ips_adjust)
         write_file_atomic(os.path.join(out, f"{k}.nes"),
                           build_patched_nes(g, pe, **opts))
@@ -806,17 +899,21 @@ REGION_TAG = {"US": "USA", "JP": "Japan"}
 
 
 def export_roms(game_dir: str, dest: str, *, source: Optional[str] = None,
-                target: str = "all", seed: Optional[str] = None,
+                target="all", seed: Optional[str] = None,
                 weakness: bool = True, weapons: bool = True,
                 palette: bool = True, visualizer: bool = False,
+                victory_lap: bool = False, door_palette: bool = False,
+                vanilla_wily: bool = False, cursor_tint: bool = False,
+                hard_mode: bool = False, ohko: bool = False,
                 romhacks: Optional[List[str]] = None,
                 ips_adjust: int = 0, auto_romhacks: bool = True,
                 quiet: bool = False) -> Dict[str, str]:
     """Extract the 12 ROMs (patched where selected) to *dest* with friendly
     filenames, for use in the user's own emulators. Returns key -> path.
 
-    Same options as :func:`prepare_roms`: `target` is a game key or 'all';
-    games other than the target are exported vanilla."""
+    Same options as :func:`prepare_roms`: `target` is a game key, a comma
+    list, or 'all'; games other than the target are exported vanilla."""
+    targets = _split_targets(target)
     src = find_source(game_dir, source)
     pe = PE(src)
     os.makedirs(dest, exist_ok=True)
@@ -824,13 +921,16 @@ def export_roms(game_dir: str, dest: str, *, source: Optional[str] = None,
     for k in GAME_ORDER:
         g = romtable.GAMES[k]
         opts = {}
-        if target in ("all", k):
+        if "all" in targets or k in targets:
             hacks = list(romhacks or [])
             if auto_romhacks:
                 hacks = discover_romhacks(game_dir, k) + hacks
             opts = dict(seed=(seed if k in RANDO_GAMES else None),
                         weakness=weakness, weapons=weapons, palette=palette,
-                        visualizer=visualizer, romhacks=hacks,
+                        visualizer=visualizer, victory_lap=victory_lap,
+                        door_palette=door_palette, vanilla_wily=vanilla_wily,
+                        cursor_tint=cursor_tint, hard_mode=hard_mode,
+                        ohko=ohko, romhacks=hacks,
                         ips_adjust=ips_adjust)
         name = f"{g.title} ({REGION_TAG.get(g.region, g.region)}).nes"
         out = os.path.join(dest, name)
@@ -909,10 +1009,16 @@ def cmd_patch(args: argparse.Namespace) -> int:
     _apply_palette_only(args)
     seed = _seed_arg(args)
     out = args.out or os.path.join(args.game_dir, "roms")
-    patch_game(args.game_dir, out, args.game, source=args.source, seed=seed,
-               weakness=args.weakness, weapons=args.weapons, palette=args.palette,
-               visualizer=args.visualizer, romhacks=args.romhack,
-               ips_adjust=args.ips_adjust, auto_romhacks=not args.no_romhacks)
+    targets = _split_targets(args.game)
+    keys = GAME_ORDER if "all" in targets else [k for k in GAME_ORDER if k in targets]
+    for k in keys:
+        patch_game(args.game_dir, out, k, source=args.source, seed=seed,
+                   weakness=args.weakness, weapons=args.weapons, palette=args.palette,
+                   visualizer=args.visualizer, victory_lap=args.victory_lap,
+                   door_palette=args.door_palette, vanilla_wily=args.vanilla_wily,
+                   cursor_tint=args.cursor_tint, hard_mode=args.hard_mode,
+                   ohko=args.ohko, romhacks=args.romhack,
+                   ips_adjust=args.ips_adjust, auto_romhacks=not args.no_romhacks)
     return 0
 
 
@@ -922,14 +1028,25 @@ def cmd_export(args: argparse.Namespace) -> int:
     if args.vanilla:
         seed = None
         weakness = weapons = palette = visualizer = False
+        victory_lap = door_palette = vanilla_wily = cursor_tint = False
+        hard_mode = False
+        ohko = False
     else:
         _apply_palette_only(args)
         seed = _seed_arg(args)
         weakness, weapons, palette = args.weakness, args.weapons, args.palette
         visualizer = args.visualizer
+        victory_lap, door_palette = args.victory_lap, args.door_palette
+        vanilla_wily = args.vanilla_wily
+        cursor_tint = args.cursor_tint
+        hard_mode = args.hard_mode
+        ohko = args.ohko
     export_roms(args.game_dir, dest, source=args.source, target=args.game,
                 seed=seed, weakness=weakness, weapons=weapons, palette=palette,
-                visualizer=visualizer, romhacks=args.romhack,
+                visualizer=visualizer, victory_lap=victory_lap,
+                door_palette=door_palette, vanilla_wily=vanilla_wily,
+                cursor_tint=cursor_tint, hard_mode=hard_mode, ohko=ohko,
+                romhacks=args.romhack,
                 ips_adjust=args.ips_adjust, auto_romhacks=not args.no_romhacks)
     return 0
 
@@ -1003,6 +1120,9 @@ def cmd_play(args: argparse.Namespace) -> int:
     prepare_roms(args.game_dir, out, source=args.source, target=args.game,
                  seed=seed, weakness=args.weakness, weapons=args.weapons,
                  palette=args.palette, visualizer=args.visualizer,
+                 victory_lap=args.victory_lap, door_palette=args.door_palette,
+                 vanilla_wily=args.vanilla_wily, cursor_tint=args.cursor_tint,
+                 hard_mode=args.hard_mode, ohko=args.ohko,
                  romhacks=args.romhack, ips_adjust=args.ips_adjust,
                  auto_romhacks=not args.no_romhacks)
     if args.no_launch:
@@ -1017,10 +1137,16 @@ def cmd_play(args: argparse.Namespace) -> int:
 GUI_MODES = [
     "Vanilla",
     "ROM hack only",
-    "Randomized (fresh seed)",
-    "Randomized (custom seed)",
+    "Randomized",
     "Palette shuffle only",
-    "Randomized + weakness visualizer",
+]
+
+# Per-game option tabs: (tab title, [US key, JP key], mm1_extra). The
+# `mm1_extra` flag enables the MM1-only boxes (Wily/cursor-tint). Prototype
+# ships MM1/RK1 only; the other pairs slot in the same way as the tab
+# system rolls out.
+GAME_TABS = [
+    ("MM1 / RK1", ["mm1", "rk1"], True),
 ]
 
 
@@ -1057,7 +1183,8 @@ STATE_BUTTONS = ["a", "b", "x", "y", "lb", "rb", "back", "start", "ls", "rs",
                  "dpad_up", "dpad_down", "dpad_left", "dpad_right", "off"]
 DEFAULT_SAVE_STATE = "lb+y"
 DEFAULT_LOAD_STATE = "lb+b"
-DEFAULT_RESET_STATE = "lb+x"
+DEFAULT_RESET_STATE = "lb+start"
+DEFAULT_TURBO_STATE = "lb+x"
 
 
 def split_state_combo(s: str):
@@ -1132,18 +1259,27 @@ def cmd_gui(args: argparse.Namespace) -> int:
     game_dir = tk.StringVar(value=cfg.get("game_dir") or args.game_dir or game_dir_default())
     core = tk.StringVar(value=cfg.get("core") or "")
     steamless_cli = tk.StringVar(value=cfg.get("steamless") or "")
-    g0 = romtable.GAMES[GAME_ORDER[0]]
-    game_label = tk.StringVar(value=f"{g0.title}  [{g0.region}]")
-    mode = tk.StringVar(value=GUI_MODES[0])
-    seed = tk.StringVar(value="")
-    hack = tk.StringVar(value="<none>")
-    game_labels = {f"{romtable.GAMES[k].title}  [{romtable.GAMES[k].region}]": k
-                   for k in GAME_ORDER}
+    # Per-game options live in the tabs (see GAME_TABS); only truly global
+    # settings stay at window scope (install, core, overclock, controls).
 
-    ttk.Label(root, text="20XX", font=("Helvetica", 16, "bold")).pack(pady=(10, 0))
-    ttk.Label(root, text="Mega Man Legacy Collection — Mesen launcher").pack()
+    # Scrollable content: everything packs into `body` so the window works
+    # at any height without resizing.
+    view = ttk.Frame(root)
+    view.pack(fill="both", expand=True)
+    canvas = tk.Canvas(view, highlightthickness=0)
+    vsb = ttk.Scrollbar(view, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=vsb.set)
+    vsb.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    body = ttk.Frame(canvas)
+    canvas.create_window((0, 0), window=body, anchor="nw")
+    body.bind("<Configure>", lambda _e: canvas.configure(
+        scrollregion=canvas.bbox("all")))
 
-    f1 = ttk.LabelFrame(root, text="1. Install location")
+    ttk.Label(body, text="20XX", font=("Helvetica", 16, "bold")).pack(pady=(10, 0))
+    ttk.Label(body, text="Mega Man Legacy Collection — Mesen launcher").pack()
+
+    f1 = ttk.LabelFrame(body, text="1. Install location")
     f1.pack(fill="x", padx=10, pady=6)
     ttk.Entry(f1, textvariable=game_dir).grid(row=0, column=0, sticky="ew", padx=6, pady=6)
     f1.columnconfigure(0, weight=1)
@@ -1152,11 +1288,11 @@ def cmd_gui(args: argparse.Namespace) -> int:
         d = filedialog.askdirectory(initialdir=game_dir.get() or os.path.expanduser("~"))
         if d:
             game_dir.set(d)
-            refresh_hacks()
+            refresh_hacks_all()
 
     ttk.Button(f1, text="Browse", command=browse_dir).grid(row=0, column=1, padx=4)
     ttk.Button(f1, text="Auto-detect",
-               command=lambda: (game_dir.set(game_dir_default()), refresh_hacks())
+               command=lambda: (game_dir.set(game_dir_default()), refresh_hacks_all())
                ).grid(row=0, column=2, padx=4)
 
     ttk.Label(f1, text="Steamless.CLI.exe").grid(row=1, column=0, sticky="w",
@@ -1178,7 +1314,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
                command=lambda: steamless_cli.set(_detect_steamless() or "")
                ).grid(row=2, column=2, padx=4, pady=(0, 6))
 
-    f2 = ttk.LabelFrame(root, text="2. Mesen core (user-supplied; GPLv3, not bundled)")
+    f2 = ttk.LabelFrame(body, text="2. Mesen core (user-supplied; GPLv3, not bundled)")
     f2.pack(fill="x", padx=10, pady=6)
     ttk.Entry(f2, textvariable=core).grid(row=0, column=0, sticky="ew", padx=6, pady=6)
     f2.columnconfigure(0, weight=1)
@@ -1227,40 +1363,225 @@ def cmd_gui(args: argparse.Namespace) -> int:
                 sys.stdout, sys.stderr = old
         threading.Thread(target=wrapper, daemon=True).start()
 
-    f3 = ttk.Frame(root)
+    f3 = ttk.Frame(body)
     f3.pack(fill="x", padx=10, pady=2)
     ttk.Button(f3, text="Setup / Repair", command=lambda: run(setup_task)).pack(side="left")
     ttk.Button(f3, text="Verify install", command=lambda: run(verify_task)).pack(side="left", padx=6)
 
-    f4 = ttk.LabelFrame(root, text="3. Options")
-    f4.pack(fill="x", padx=10, pady=6)
-    ttk.Label(f4, text="Game").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-    ttk.Combobox(f4, textvariable=game_label, values=list(game_labels),
-                 state="readonly", width=26).grid(row=0, column=1, padx=6)
-    ttk.Label(f4, text="Mode").grid(row=0, column=2, sticky="w", padx=6)
-    ttk.Combobox(f4, textvariable=mode, values=GUI_MODES,
-                 state="readonly", width=30).grid(row=0, column=3, padx=6)
-    ttk.Label(f4, text="Seed (5 letters)").grid(row=1, column=0, sticky="w", padx=6, pady=4)
-    vcmd = (root.register(lambda s: len(s) <= 5 and (s == "" or s.isalpha())), "%P")
-    sf = ttk.Frame(f4)
-    sf.grid(row=1, column=1, sticky="w", padx=6)
-    ttk.Entry(sf, textvariable=seed, width=8, validate="key",
-              validatecommand=vcmd).pack(side="left")
-    ttk.Button(sf, text="Random", command=lambda: seed.set(random_seed())).pack(side="left", padx=4)
-    ttk.Label(f4, text="ROM hack").grid(row=1, column=2, sticky="w", padx=6)
-    hack_cb = ttk.Combobox(f4, textvariable=hack, values=["<none>"],
-                           state="readonly", width=30)
-    hack_cb.grid(row=1, column=3, padx=6)
+    # --- Global overclock (applies to every game) ---
+    fg = ttk.LabelFrame(body, text="3. Overclock (global)")
+    fg.pack(fill="x", padx=10, pady=6)
     oc_follow = tk.BooleanVar(value=bool(cfg.get("oc_follow", True)))
     oc_turbo = tk.StringVar(value=str(cfg.get("oc_turbo", 262)))
-    ttk.Checkbutton(f4, text="Overclock: follow in-game CPU SPEED",
-                    variable=oc_follow).grid(row=2, column=0, columnspan=2,
-                                             sticky="w", padx=6, pady=4)
-    ttk.Label(f4, text="Turbo scanlines").grid(row=2, column=2, sticky="w", padx=6)
-    ttk.Entry(f4, textvariable=oc_turbo, width=8).grid(row=2, column=3,
+    ttk.Checkbutton(fg, text="Follow in-game CPU SPEED",
+                    variable=oc_follow).grid(row=0, column=0, sticky="w",
+                                             padx=6, pady=4)
+    ttk.Label(fg, text="Turbo scanlines").grid(row=0, column=1, sticky="w", padx=6)
+    ttk.Entry(fg, textvariable=oc_turbo, width=8).grid(row=0, column=2,
                                                        sticky="w", padx=6)
 
-    f6 = ttk.LabelFrame(root, text="4. Controls (NES button -> Xbox button)")
+    # --- 4. Game tabs (per-game options) ---
+    nb = ttk.Notebook(body)
+    nb.pack(fill="x", padx=10, pady=6)
+    tabs: "list[dict]" = []
+
+    def save_runtime():
+        gd = game_dir.get().strip()
+        if not gd:
+            return
+        write_input_map(gd, {k: v.get() for k, v in input_vars.items()})
+        ini_set(gd, {"state_save_button": join_state_combo(save_mod.get(), save_btn.get()),
+                     "state_load_button": join_state_combo(load_mod.get(), load_btn.get()),
+                     "state_reset_button": join_state_combo(reset_mod.get(), reset_btn.get()),
+                     "state_slot": state_slot.get().strip() or "0"})
+
+    def tab_targets(tab):
+        t = tab["v"]["target"].get()
+        return list(tab["keys"]) if t == "both" else [t]
+
+    def tab_opts(tab):
+        v = tab["v"]
+        opts: dict = {"auto_romhacks": False}
+        m = v["mode"].get()
+        if m == "Randomized":
+            opts["seed"] = v["seed"].get().strip() or random_seed()
+            opts["visualizer"] = True
+        elif m == "Palette shuffle only":
+            opts.update(seed=random_seed(), weakness=False, weapons=False,
+                        palette=True)
+        if tab["mm1"]:
+            opts["victory_lap"] = v["victory_lap"].get()
+            opts["door_palette"] = v["door_palette"].get()
+            opts["vanilla_wily"] = v["vanilla_wily"].get()
+            opts["cursor_tint"] = v["cursor_tint"].get()
+            opts["hard_mode"] = v["hard_mode"].get()
+            opts["ohko"] = v["ohko"].get()
+        gd = game_dir.get().strip()
+        primary = tab["keys"][0]
+        hs = v["hack"].get()
+        if hs and hs != "<none>":
+            found = discover_romhacks(gd, primary)
+            if hs == "<all>":
+                opts["romhacks"] = found
+            else:
+                picks = [h for h in found if os.path.basename(h) == hs]
+                if picks:
+                    opts["romhacks"] = picks
+        elif m == "ROM hack only":
+            found = discover_romhacks(gd, primary)
+            if found:
+                opts["romhacks"] = found
+            else:
+                logq.put(f"[20xx] no patches in romhacks/{primary}/ - "
+                         "drop .ips/.bps there")
+                return None
+        return opts
+
+    def launch_tab(tab):
+        gd = game_dir.get().strip()
+        if not gd:
+            logq.put("Set the install folder first.")
+            return
+        opts = tab_opts(tab)
+        if opts is None:
+            return
+        save_runtime()
+        targets = tab_targets(tab)
+        logq.put(f"[20xx] build {targets} mode={tab['v']['mode'].get()} "
+                 f"seed={opts.get('seed', '-')}")
+        prepare_roms(gd, os.path.join(gd, "roms"), target=targets, **opts)
+        logq.put("[20xx] launching collection...")
+        try:
+            ensure_mesen_host(gd)
+        except Exception as ex:
+            logq.put(f"[20xx] host start failed (continuing): {ex}")
+        launch(args.appid)
+
+    def build_tab(tab):
+        gd = game_dir.get().strip()
+        if not gd:
+            logq.put("Set the install folder first.")
+            return
+        opts = tab_opts(tab)
+        if opts is None:
+            return
+        targets = tab_targets(tab)
+        logq.put(f"[20xx] building {targets} (no launch) "
+                 f"seed={opts.get('seed', '-')}")
+        prepare_roms(gd, os.path.join(gd, "roms"), target=targets, **opts)
+        logq.put("[20xx] done - launch the collection when ready.")
+
+    def export_tab(tab):
+        gd = game_dir.get().strip()
+        if not gd:
+            logq.put("Set the install folder first.")
+            return
+        opts = tab_opts(tab)
+        if opts is None:
+            return
+        targets = tab_targets(tab)
+        dest = filedialog.askdirectory(
+            initialdir=os.path.expanduser("~"), title="Export ROMs to folder")
+        if not dest:
+            logq.put("[20xx] export cancelled")
+            return
+        dest = os.path.join(dest, "MMLC-ROMs")
+        export_roms(gd, dest, target=targets, **opts)
+        logq.put(f"[20xx] exported -> {dest}")
+
+    seed_vcmd = (root.register(lambda s: len(s) <= 16), "%P")
+
+    def refresh_tab_hacks(tab):
+        gd = game_dir.get().strip()
+        primary = tab["keys"][0]
+        found = ([os.path.basename(h) for h in discover_romhacks(gd, primary)]
+                 if gd else [])
+        tab["hack_cb"]["values"] = ["<none>"] + found + (["<all>"] if found else [])
+        tab["v"]["hack"].set("<none>")
+
+    def refresh_hacks_all(*_):
+        for tab in tabs:
+            refresh_tab_hacks(tab)
+
+    def build_game_tab(title, keys, mm1_extra):
+        fr = ttk.Frame(nb)
+        nb.add(fr, text=title)
+        v = dict(
+            target=tk.StringVar(value=keys[0]),
+            mode=tk.StringVar(value=GUI_MODES[0]),
+            seed=tk.StringVar(value=""),
+            hack=tk.StringVar(value="<none>"),
+            victory_lap=tk.BooleanVar(value=False),
+            door_palette=tk.BooleanVar(value=False),
+            vanilla_wily=tk.BooleanVar(value=False),
+            cursor_tint=tk.BooleanVar(value=False),
+            hard_mode=tk.BooleanVar(value=False),
+            ohko=tk.BooleanVar(value=False),
+        )
+        ttk.Label(fr, text="Target").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        tvals = list(keys) + (["both"] if len(keys) > 1 else [])
+        ttk.Combobox(fr, textvariable=v["target"], values=tvals, state="readonly",
+                     width=8).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(fr, text="Mode").grid(row=0, column=2, sticky="w", padx=6)
+        ttk.Combobox(fr, textvariable=v["mode"], values=GUI_MODES,
+                     state="readonly", width=22).grid(row=0, column=3, sticky="w",
+                                                      padx=6)
+        ttk.Label(fr, text="Seed (blank = random)").grid(row=1, column=0, sticky="w",
+                                                         padx=6, pady=4)
+        sf = ttk.Frame(fr)
+        sf.grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Entry(sf, textvariable=v["seed"], width=12, validate="key",
+                  validatecommand=seed_vcmd).pack(side="left")
+        ttk.Button(sf, text="Random",
+                   command=lambda: v["seed"].set(random_seed())).pack(side="left",
+                                                                      padx=4)
+        ttk.Label(fr, text="ROM hack").grid(row=1, column=2, sticky="w", padx=6)
+        hack_cb = ttk.Combobox(fr, textvariable=v["hack"], values=["<none>"],
+                               state="readonly", width=22)
+        hack_cb.grid(row=1, column=3, sticky="w", padx=6)
+        if mm1_extra:
+            ttk.Checkbutton(fr, text="Victory lap (max boss damage)",
+                            variable=v["victory_lap"]).grid(
+                                row=2, column=0, columnspan=2, sticky="w",
+                                padx=6, pady=(4, 0))
+            ttk.Checkbutton(fr, text="Boss doors tinted by weakness",
+                            variable=v["door_palette"]).grid(
+                                row=2, column=2, columnspan=2, sticky="w",
+                                padx=6, pady=(4, 0))
+            ttk.Checkbutton(fr, text="Vanilla Wily (no Wily changes)",
+                            variable=v["vanilla_wily"]).grid(
+                                row=3, column=0, columnspan=2, sticky="w",
+                                padx=6, pady=(0, 4))
+            ttk.Checkbutton(fr, text="Stage-select cursor tint (weakness + green)",
+                            variable=v["cursor_tint"]).grid(
+                                row=3, column=2, columnspan=2, sticky="w",
+                                padx=6, pady=(0, 4))
+            ttk.Checkbutton(fr, text="Hard mode (damage received x2, dealt /1.5)",
+                            variable=v["hard_mode"]).grid(
+                                row=4, column=0, columnspan=2, sticky="w",
+                                padx=6, pady=(0, 4))
+            ttk.Checkbutton(fr, text="OHKO (any hit = instant death)",
+                            variable=v["ohko"]).grid(
+                                row=4, column=2, columnspan=2, sticky="w",
+                                padx=6, pady=(0, 4))
+        bf = ttk.Frame(fr)
+        bf.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=6)
+        tab = {"keys": list(keys), "mm1": mm1_extra, "v": v, "hack_cb": hack_cb}
+        ttk.Button(bf, text="Build & Launch",
+                   command=lambda: run(lambda: launch_tab(tab))).pack(side="left")
+        ttk.Button(bf, text="Build only",
+                   command=lambda: run(lambda: build_tab(tab))).pack(side="left", padx=6)
+        ttk.Button(bf, text="Export...",
+                   command=lambda: run(lambda: export_tab(tab))).pack(side="left", padx=6)
+        ttk.Button(bf, text="Open romhacks",
+                   command=lambda: run(open_romhacks)).pack(side="left", padx=6)
+        tabs.append(tab)
+        refresh_tab_hacks(tab)
+
+    for _title, _keys, _mm1 in GAME_TABS:
+        build_game_tab(_title, _keys, _mm1)
+
+    f6 = ttk.LabelFrame(body, text="4. Controls (NES button -> Xbox button)")
     f6.pack(fill="x", padx=10, pady=6)
     input_vars: dict = {}
     saved_map = cfg.get("input_map", DEFAULT_INPUT_MAP)
@@ -1286,6 +1607,10 @@ def cmd_gui(args: argparse.Namespace) -> int:
     load_btn = tk.StringVar(value=ld_btn)
     reset_mod = tk.StringVar(value=rs_mod)
     reset_btn = tk.StringVar(value=rs_btn)
+    tb_mod, tb_btn = split_state_combo(
+        cfg.get("state_turbo_button", DEFAULT_TURBO_STATE))
+    turbo_mod = tk.StringVar(value=tb_mod)
+    turbo_btn = tk.StringVar(value=tb_btn)
     state_slot = tk.StringVar(value=str(cfg.get("state_slot", 0)))
     ttk.Label(f6, text="Save state").grid(row=2, column=0, sticky="e", padx=4, pady=3)
     ttk.Combobox(f6, textvariable=save_mod, values=STATE_MODIFIERS,
@@ -1304,23 +1629,22 @@ def cmd_gui(args: argparse.Namespace) -> int:
                  state="readonly", width=6).grid(row=3, column=1, sticky="w")
     ttk.Combobox(f6, textvariable=reset_btn, values=STATE_BUTTONS,
                  state="readonly", width=9).grid(row=3, column=2, sticky="w")
+    ttk.Label(f6, text="Turbo (hold)").grid(row=3, column=3, sticky="e", padx=4)
+    ttk.Combobox(f6, textvariable=turbo_mod, values=STATE_MODIFIERS,
+                 state="readonly", width=6).grid(row=3, column=4, sticky="w")
+    ttk.Combobox(f6, textvariable=turbo_btn, values=STATE_BUTTONS,
+                 state="readonly", width=9).grid(row=3, column=5, sticky="w")
     ttk.Button(f6, text="Save controls", command=lambda: run(save_controls)
                ).grid(row=4, column=0, columnspan=2, pady=4, sticky="w")
 
-    f5 = ttk.Frame(root)
+    f5 = ttk.Frame(body)
     f5.pack(fill="x", padx=10, pady=4)
-    ttk.Button(f5, text="Prepare & Launch", command=lambda: run(launch_task)).pack(side="left")
-    ttk.Button(f5, text="Open romhacks folder",
-               command=lambda: run(open_romhacks)
-               ).pack(side="left", padx=6)
     ttk.Button(f5, text="Rescan hacks",
-               command=lambda: (refresh_hacks(), logq.put("[20xx] romhack list refreshed"))
-               ).pack(side="left", padx=6)
-    ttk.Button(f5, text="Export ROMs...",
-               command=lambda: run(export_task)
+               command=lambda: (refresh_hacks_all(),
+                                logq.put("[20xx] romhack list refreshed"))
                ).pack(side="left", padx=6)
 
-    log = ScrolledText(root, height=15, state="disabled", font=("monospace", 9))
+    log = ScrolledText(body, height=15, state="disabled", font=("monospace", 9))
     log.pack(fill="both", expand=True, padx=10, pady=(4, 10))
 
     def append(msg):
@@ -1336,14 +1660,6 @@ def cmd_gui(args: argparse.Namespace) -> int:
         except queue.Empty:
             pass
         root.after(100, pump)
-
-    def refresh_hacks(*_):
-        key = game_labels.get(game_label.get(), GAME_ORDER[0])
-        found = [os.path.basename(h) for h in discover_romhacks(game_dir.get(), key)]
-        hack_cb["values"] = ["<none>"] + found + (["<all>"] if found else [])
-        hack.set("<none>")
-
-    game_label.trace_add("write", lambda *a: refresh_hacks())
 
     def build_core_task():
         c = build_core(None, status=lambda m: logq.put(m))
@@ -1365,21 +1681,24 @@ def cmd_gui(args: argparse.Namespace) -> int:
         sv = join_state_combo(save_mod.get(), save_btn.get())
         ld = join_state_combo(load_mod.get(), load_btn.get())
         rs = join_state_combo(reset_mod.get(), reset_btn.get())
+        tb = join_state_combo(turbo_mod.get(), turbo_btn.get())
         slot = state_slot.get().strip() or "0"
         if gd:
             write_input_map(gd, m)
             ini_set(gd, {"state_save_button": sv, "state_load_button": ld,
-                         "state_reset_button": rs, "state_slot": slot})
+                         "state_reset_button": rs, "state_turbo_button": tb,
+                         "state_slot": slot})
         c = dict(gui_config_load())
         c.update({"game_dir": gd, "core": core.get().strip(),
                   "steamless": steamless_cli.get().strip(), "input_map": m,
                   "state_save_button": sv, "state_load_button": ld,
-                  "state_reset_button": rs, "state_slot": slot})
+                  "state_reset_button": rs, "state_turbo_button": tb,
+                  "state_slot": slot})
         gui_config_save(c)
         logq.put("[20xx] controls saved: "
                  + ", ".join(f"{k[4:]}={v}" for k, v in m.items()))
-        logq.put(f"[20xx] state hotkeys: save={sv} load={ld} reset={rs} slot={slot}")
-        logq.put(f"[20xx] state hotkeys: save={sv} load={ld} slot={slot}")
+        logq.put(f"[20xx] state hotkeys: save={sv} load={ld} reset={rs} "
+                 f"turbo={tb} slot={slot}")
 
     def setup_task():
         gd = game_dir.get().strip()
@@ -1413,10 +1732,11 @@ def cmd_gui(args: argparse.Namespace) -> int:
         sv = join_state_combo(save_mod.get(), save_btn.get())
         ld = join_state_combo(load_mod.get(), load_btn.get())
         rs = join_state_combo(reset_mod.get(), reset_btn.get())
+        tb = join_state_combo(turbo_mod.get(), turbo_btn.get())
         ini_set(gd, {"state_save_button": sv, "state_load_button": ld,
-                     "state_reset_button": rs,
+                     "state_reset_button": rs, "state_turbo_button": tb,
                      "state_slot": state_slot.get().strip() or "0"})
-        logq.put(f"[20xx] state hotkeys: save={sv} load={ld} reset={rs}")
+        logq.put(f"[20xx] state hotkeys: save={sv} load={ld} reset={rs} turbo={tb}")
         host = ensure_host()
         if host:
             logq.put(f"[20xx] mesen_host: {host}")
@@ -1427,7 +1747,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
                    "steamless": steamless_cli.get().strip(),
                    "oc_follow": bool(oc_follow.get()), "oc_turbo": turbo,
                    "state_save_button": sv, "state_load_button": ld,
-                   "state_reset_button": rs,
+                   "state_reset_button": rs, "state_turbo_button": tb,
                    "state_slot": state_slot.get().strip() or "0",
                    "input_map": {k: v.get() for k, v in input_vars.items()}})
         gui_config_save(c2)
@@ -1447,77 +1767,23 @@ def cmd_gui(args: argparse.Namespace) -> int:
                      f"{'ok' if ok else 'MISMATCH'}")
         logq.put(f"[20xx] verify: {len(GAME_ORDER) - bad}/{len(GAME_ORDER)} ok")
 
-    def gui_patch_opts(gd):
-        """Build the patch options from the GUI widgets for one game."""
-        key = game_labels.get(game_label.get(), GAME_ORDER[0])
-        m = mode.get()
-        opts: dict = {"target": key, "auto_romhacks": False}
-        if m == "Randomized (fresh seed)":
-            opts["seed"] = random_seed()
-        elif m == "Randomized (custom seed)":
-            opts["seed"] = seed.get().strip() or random_seed()
-        elif m == "Palette shuffle only":
-            opts.update(seed=random_seed(), weakness=False, weapons=False, palette=True)
-        elif m == "Randomized + weakness visualizer":
-            opts.update(seed=random_seed(), visualizer=True)
-        hs = hack.get()
-        if hs and hs != "<none>":
-            found = discover_romhacks(gd, key)
-            if hs == "<all>":
-                opts["romhacks"] = found
-            else:
-                picks = [h for h in found if os.path.basename(h) == hs]
-                if picks:
-                    opts["romhacks"] = picks
-        elif m == "ROM hack only":
-            found = discover_romhacks(gd, key)
-            if found:
-                opts["romhacks"] = found
-                hs = "<all>"
-            else:
-                logq.put(f"[20xx] no patches in romhacks/{key}/ — drop .ips/.bps there")
-                return key, m, None, hs
-        return key, m, opts, hs
-
-    def launch_task():
-        gd = game_dir.get().strip()
-        key, m, opts, hs = gui_patch_opts(gd)
-        if opts is None:
-            return
-        write_input_map(gd, {k: v.get() for k, v in input_vars.items()})
-        ini_set(gd, {"state_save_button": join_state_combo(save_mod.get(), save_btn.get()),
-                     "state_load_button": join_state_combo(load_mod.get(), load_btn.get()),
-                     "state_reset_button": join_state_combo(reset_mod.get(), reset_btn.get()),
-                     "state_slot": state_slot.get().strip() or "0"})
-        logq.put(f"[20xx] {key}: {m} seed={opts.get('seed', '-')} hack={hs}")
-        prepare_roms(gd, os.path.join(gd, "roms"), **opts)
-        logq.put("[20xx] launching collection...")
+    def _wheel(e):
+        # Widgets that scroll/select themselves keep the event.
         try:
-            ensure_mesen_host(gd)
-        except Exception as ex:
-            logq.put(f"[20xx] host start failed (continuing): {ex}")
-        launch(args.appid)
+            cls = e.widget.winfo_class()
+        except Exception:
+            cls = ""
+        if cls in ("Text", "TCombobox", "Listbox", "Scrollbar", "TScrollbar"):
+            return
+        if getattr(e, "num", None) == 4 or getattr(e, "delta", 0) > 0:
+            canvas.yview_scroll(-1, "units")
+        elif getattr(e, "num", None) == 5 or getattr(e, "delta", 0) < 0:
+            canvas.yview_scroll(1, "units")
 
-    def export_task():
-        gd = game_dir.get().strip()
-        if not gd:
-            logq.put("Set the install folder first.")
-            return
-        key, m, opts, hs = gui_patch_opts(gd)
-        if opts is None:
-            return
-        dest = filedialog.askdirectory(
-            initialdir=os.path.expanduser("~"),
-            title="Export ROMs to folder")
-        if not dest:
-            logq.put("[20xx] export cancelled")
-            return
-        logq.put(f"[20xx] {key}: {m} seed={opts.get('seed', '-')} hack={hs}")
-        dest = os.path.join(dest, "MMLC-ROMs")
-        export_roms(gd, dest, **opts)
-        logq.put(f"[20xx] open this folder in your emulator: {dest}")
+    for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        root.bind_all(_seq, _wheel, add="+")
 
-    refresh_hacks()
+    refresh_hacks_all()
     pump()
     root.mainloop()
     return 0
@@ -1678,8 +1944,23 @@ def _add_patch_opts(sp: argparse.ArgumentParser) -> argparse.ArgumentParser:
                     default=True, help="shuffle palettes (MM1/MM2/MM3/MM4/MM5)")
     sp.add_argument("--palette-only", action="store_true",
                     help="only shuffle the palette (seed implied)")
-    sp.add_argument("--visualizer", action="store_true",
-                    help="apply the weakness visualizer IPS (MM1)")
+    sp.add_argument("--visualizer", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="apply the weakness visualizer IPS (MM1, always on "
+                         "for stage-select colors + green marker)")
+    sp.add_argument("--victory-lap", action="store_true",
+                    help="MM1: max out all boss damage (easy kills)")
+    sp.add_argument("--door-palette", action="store_true",
+                    help="MM1: tint each boss door with its weakness color")
+    sp.add_argument("--vanilla-wily", action="store_true",
+                    help="MM1: keep the Wily-stage damage rows vanilla")
+    sp.add_argument("--cursor-tint", action="store_true",
+                    help="MM1: tint the selected stage-select portrait with "
+                         "its weakness color (green for top-buster)")
+    sp.add_argument("--hard-mode", action="store_true",
+                    help="MM1: hard mode (damage received x2, dealt /1.5)")
+    sp.add_argument("--ohko", action="store_true",
+                    help="MM1: OHKO mode (any hit = instant death, both ways)")
     sp.add_argument("--romhack", action="append", default=None, metavar="FILE",
                     help="apply an IPS/BPS ROM hack (repeatable)")
     sp.add_argument("--no-romhacks", action="store_true",
@@ -1775,7 +2056,9 @@ def build_parser() -> argparse.ArgumentParser:
     st.add_argument("--load-button", default=None,
                     help="combo that loads a state, e.g. lb+b (or 'off')")
     st.add_argument("--reset-button", default=None,
-                    help="combo that soft-resets the console, e.g. lb+x (or 'off')")
+                    help="combo that soft-resets the console, e.g. lb+start (or 'off')")
+    st.add_argument("--turbo-button", default=None,
+                    help="combo that fast-forwards while held, e.g. lb+x (or 'off')")
     st.add_argument("--slot", type=int, default=None,
                     help="save-state slot (default 0)")
     st.set_defaults(func=cmd_states)
