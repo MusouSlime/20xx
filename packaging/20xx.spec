@@ -36,6 +36,7 @@ hiddenimports = [
     "tkinter.scrolledtext",
     "mmlc",
     "mmlc.collections",
+    "mmlc.setup_env",
     "mmlc.hardmode",
     "mmlc.locale_mod",
     "mmlc.wily",

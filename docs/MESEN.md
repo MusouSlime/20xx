@@ -128,6 +128,12 @@ The patch adds a `CaptureRenderer : IRenderingDevice` and exports
 (InteropDLL), and falls back to the built-in 2C02 palette when the headless
 `NesConfig.UserPalette` is all zero (the GUI normally populates it).
 
+On either platform, `20xx setup --start` auto-detects the Steam library,
+downloads Steamless if needed, unpacks `Proteus.exe`, backs up Valve's DLL as
+`steam_api_orig.dll`, installs the proxy, finds (or optionally builds) the core,
+extracts the ROMs and starts the host. `20xx doctor` prints the same readiness
+checks without changing anything.
+
 Build and run the host (Linux):
 
 ```bash

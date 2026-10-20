@@ -18,8 +18,10 @@ Usage (all commands are terminal/CLI; no GUI required):
     20xx.py patch GAME [opts]        # offline randomizer / palette / ROM hacks
     20xx.py play [GAME] [opts]       # patch + start host + launch, from the CLI
     20xx.py launch [--print]         # launch the collection (or print the cmd)
+    20xx.py doctor                   # readiness check (install/proxy/core/host)
+    20xx.py setup [--start]          # automatic setup (unpack, proxy, core, ROMs)
     20xx.py mesen --core PATH        # enable the Mesen replacer (your core)
-    20xx.py unpack [--steamless P]   # Steamless-unpack Proteus.exe (Setup/Repair)
+    20xx.py unpack [--steamless P]   # Steamless-unpack Proteus.exe by hand
     20xx.py                          # interactive: pick a game, choose what to
                                      #   do (vanilla / rando / palette / ROM
                                      #   hack), then launch with Mesen
@@ -73,7 +75,8 @@ else:
 sys.path.insert(0, os.path.join(BUNDLE, "tools"))
 os.makedirs(BUILD_DIR, exist_ok=True)
 
-from mmlc import hardmode, patcher, randomizer, romhack, romtable, steamless, wily
+from mmlc import (hardmode, patcher, randomizer, romhack, romtable,
+                  setup_env, steamless, wily)
 from mmlc.pe import PE, write_file_atomic
 
 _WIN = sys.platform.startswith("win")
@@ -155,7 +158,12 @@ GAME_ORDER = ["mm1", "mm2", "mm3", "mm4", "mm5", "mm6",
 
 
 def game_dir_default() -> str:
-    return os.environ.get("MMLC_GAME", DEFAULT_GAME_DIR)
+    env = os.environ.get("MMLC_GAME")
+    if env:
+        return env
+    # Follow Steam libraries instead of assuming the default install drive.
+    found = setup_env.find_install()
+    return found or DEFAULT_GAME_DIR
 
 
 def find_source(game_dir: str, override: Optional[str] = None) -> str:
@@ -178,7 +186,7 @@ def find_source(game_dir: str, override: Optional[str] = None) -> str:
 # --- Steamless (SteamStub unpack) -------------------------------------------
 # The Mesen proxy's hooks are AOB-scanned in the *unpacked* .text. A clean Steam
 # install ships the SteamStub-packed Proteus.exe (extra `.bind` section, entry in
-# `.bind`), so every scan misses and 20XX does nothing. Setup/Repair unpacks it.
+# `.bind`), so every scan misses and 20XX does nothing. Automatic setup unpacks it.
 PROTEUS_NAME = "Proteus.exe"
 PROTEUS_ORIG_BAK = "Proteus.exe.orig.bak"
 PROTEUS_PACKED_BAK = "Proteus.exe.packed.bak"
@@ -747,28 +755,62 @@ def cmd_build_core(args: argparse.Namespace) -> int:
 
 
 def install_proxy(game_dir: str) -> bool:
+    """Install our proxy, keeping Valve's DLL as ``steam_api_orig.dll``.
+
+    The original must be renamed *before* the proxy is copied in; the proxy
+    forwards every export to ``steam_api_orig.dll``. If a proxy is already
+    installed this is a no-op apart from refreshing the DLL.
+    """
+    import filecmp
+    import shutil
+
     dest = os.path.join(game_dir, "steam_api.dll")
-    if os.path.exists(PROXY_BUILD):
-        import shutil
-        shutil.copy2(PROXY_BUILD, dest)
-        print(f"20xx: installed proxy -> {dest}")
-        return True
-    if os.path.exists(PROXY_BUILD_SCRIPT):
+    orig = os.path.join(game_dir, "steam_api_orig.dll")
+
+    if not os.path.exists(PROXY_BUILD):
+        if not os.path.exists(PROXY_BUILD_SCRIPT):
+            print("20xx: no proxy build script or prebuilt proxy")
+            return False
+        if not os.path.exists(orig) and not os.path.exists(dest):
+            print("20xx: steam_api.dll not found in the install")
+            return False
         print("20xx: building proxy (needs i686-w64-mingw32-gcc)...")
         env = dict(os.environ)
-        # Never write into a read-only bundle (AppImage); build into BUILD_DIR.
         env["OUT"] = PROXY_BUILD
-        orig = os.path.join(game_dir, "steam_api_orig.dll")
-        if os.path.exists(orig):
-            env["STEAM_API"] = orig
-        rc = subprocess.call(["bash", PROXY_BUILD_SCRIPT], env=env)
-        if rc == 0 and os.path.exists(PROXY_BUILD):
-            import shutil
-            shutil.copy2(PROXY_BUILD, dest)
-            print(f"20xx: installed proxy -> {dest}")
-            return True
-    print("20xx: no built proxy; run build/build_proxy.sh first")
-    return False
+        env["STEAM_API"] = orig if os.path.exists(orig) else dest
+        try:
+            rc = subprocess.call(["bash", PROXY_BUILD_SCRIPT], env=env)
+        except FileNotFoundError:
+            print("20xx: bash not found; install Git Bash/MSYS2 or build the "
+                  "proxy on a machine that has mingw-w64")
+            return False
+        if rc != 0 or not os.path.exists(PROXY_BUILD):
+            print("20xx: proxy build failed")
+            return False
+
+    if not os.path.exists(dest) and not os.path.exists(orig):
+        print("20xx: steam_api.dll not found in the install; cannot install proxy")
+        return False
+
+    if os.path.exists(dest) and not os.path.exists(orig):
+        try:
+            if not filecmp.cmp(PROXY_BUILD, dest, shallow=False):
+                os.replace(dest, orig)
+                print(f"20xx: saved original DLL -> {os.path.basename(orig)}")
+            else:
+                print("20xx: warning: proxy is installed but no "
+                      "steam_api_orig.dll backup exists")
+        except OSError as ex:
+            print(f"20xx: cannot back up steam_api.dll: {ex}")
+            return False
+
+    try:
+        shutil.copy2(PROXY_BUILD, dest)
+    except OSError as ex:
+        print(f"20xx: cannot install proxy: {ex}")
+        return False
+    print(f"20xx: installed proxy -> {dest}")
+    return True
 
 
 def host_running(port: int = DEFAULT_PORT) -> bool:
@@ -855,6 +897,209 @@ def cmd_unpack(args: argparse.Namespace) -> int:
     ok = ensure_proteus_unpacked(args.game_dir, args.steamless,
                                  force=args.force)
     return 0 if ok else 1
+
+
+def _check_line(label: str, ok: bool, detail: str = "", *, warn: bool = False) -> None:
+    mark = "ok" if ok else ("warn" if warn else "FAIL")
+    print(f"  [{mark:4}] {label}: {detail}")
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Print a setup readiness report without changing anything."""
+    gd = args.game_dir
+    if not setup_env.has_game_files(gd):
+        found = setup_env.find_install()
+        if found:
+            print(f"[20xx] auto-detected install: {found}")
+            gd = found
+        else:
+            print("[20xx] MMLC install not found. Candidates:")
+            for p in setup_env.install_candidates():
+                print(f"    {p}")
+    print("20XX doctor")
+    install_ok = setup_env.has_game_files(gd)
+    _check_line("install", install_ok, gd or "(unset)")
+    source = ""
+    if install_ok:
+        for name in ("Proteus.exe.orig.bak", "Proteus.exe"):
+            p = os.path.join(gd, name)
+            if os.path.exists(p):
+                source = p
+                break
+    _check_line("ROM source", bool(source), os.path.basename(source) if source else "missing")
+
+    packed = unpacked = False
+    exe = os.path.join(gd, PROTEUS_NAME) if gd else ""
+    if exe and os.path.exists(exe):
+        try:
+            packed = proteus_is_packed(exe)
+            unpacked = proteus_is_unpacked(exe)
+        except (OSError, ValueError):
+            pass
+    _check_line("Proteus.exe", unpacked and not packed,
+                "unpacked" if unpacked and not packed else
+                ("packed (run: 20xx setup)" if packed else "unknown"),
+                warn=not (unpacked and not packed))
+
+    try:
+        sl = steamless.find_cli(getattr(args, "steamless", None))
+        _check_line("Steamless", True, sl)
+    except steamless.SteamlessError as ex:
+        _check_line("Steamless", False, str(ex).splitlines()[0], warn=True)
+
+    proxy_ok = install_ok and setup_env.proxy_installed(gd)
+    _check_line("proxy", proxy_ok,
+                "installed" if proxy_ok else "not installed (20xx setup)",
+                warn=not proxy_ok)
+
+    core = find_core(gd, getattr(args, "core", None))
+    core_ok = False
+    if core:
+        try:
+            core_ok = check_core(core)
+            _check_line("core", core_ok, core)
+        except Exception as ex:  # noqa: BLE001 - doctor should not crash
+            _check_line("core", False, f"{core} ({ex})")
+    else:
+        _check_line("core", False, "not found (20xx build-core / --core PATH)",
+                    warn=True)
+
+    host = _BUNDLED_HOST or (HOST_BUILD if os.path.exists(HOST_BUILD) else None)
+    host_ok = bool(host)
+    if not host:
+        import shutil
+        cc = shutil.which("cc") or shutil.which("gcc")
+        host_ok = bool(cc and os.path.exists(HOST_SRC))
+    _check_line("Mesen host", host_ok,
+                host or ("will build from source" if host_ok else "missing"))
+
+    roms = 0
+    rdir = os.path.join(gd, "roms") if gd else ""
+    if rdir and os.path.isdir(rdir):
+        roms = len([n for n in os.listdir(rdir) if n.lower().endswith(".nes")])
+    _check_line("extracted ROMs", roms > 0, f"{roms} file(s)", warn=roms == 0)
+
+    if core_ok:
+        port = int(ini_get(gd, "mesen_port") or DEFAULT_PORT)
+        listening = host_running(port)
+        _check_line("host status", listening,
+                    f"listening on :{port}" if listening else "not running",
+                    warn=True)
+
+    ready = (install_ok and unpacked and not packed and proxy_ok
+             and core_ok and host_ok)
+    print("[20xx] " + ("ready to play through Mesen" if ready else
+                       "not ready - run: 20xx setup"))
+    return 0 if ready else 1
+
+
+def _confirm(prompt: str, assume_yes: bool) -> bool:
+    if assume_yes:
+        return True
+    try:
+        return input(prompt + " [Y/n] ").strip().lower() not in ("n", "no")
+    except EOFError:
+        return False
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Automatic setup: find the install, unpack, install proxy, locate/build
+    a core, configure the host, extract ROMs and verify them."""
+    gd = args.game_dir
+    if not setup_env.has_game_files(gd):
+        found = setup_env.find_install()
+        if found:
+            print(f"[20xx] auto-detected install: {found}")
+            gd = found
+        else:
+            print("20xx: MMLC install not found; pass --game-dir PATH")
+            return 1
+
+    try:
+        src = find_source(gd)
+    except SystemExit as ex:
+        print(ex)
+        return 1
+    print(f"[20xx] install: {gd}")
+    print(f"[20xx] ROM source: {os.path.basename(src)}")
+
+    unpack_ok = ensure_proteus_unpacked(gd, getattr(args, "steamless", None),
+                                        status=lambda m: print(m, flush=True))
+    if not unpack_ok:
+        print("20xx: could not unpack Proteus.exe; proxy hooks will not load")
+
+    proxy_ok = install_proxy(gd)
+    if not proxy_ok:
+        print("20xx: proxy missing; Mesen mode will not work until it is built")
+
+    core = find_core(gd, getattr(args, "core", None))
+    if not core and not args.no_core_build:
+        if _WIN:
+            print("20xx: Windows core: apply tools/mesen_host/mesen2_capture.patch")
+            print("      then build InteropDLL (x64) in Mesen.sln, or pass --core "
+                  "C:\\path\\MesenCore.dll")
+        elif _confirm("No Mesen core found. Build Mesen2 now (clone + make, "
+                      "several minutes)?", args.yes):
+            try:
+                core = build_core(status=lambda m: print(m, flush=True))
+            except Exception as ex:  # noqa: BLE001 - report build failures
+                print(f"20xx: core build failed: {ex}")
+                print("      install the Mesen2 build dependencies and retry, "
+                      "or pass --core PATH")
+    core_ok = bool(core) and check_core(core)
+    if core and not core_ok:
+        print("20xx: core is present but lacks the MMLC hooks; not enabling it")
+        print("      rebuild with tools/mesen_host/mesen2_capture.patch applied")
+
+    if core and core_ok:
+        vals = {
+            "mesen": "1",
+            "mesen_host": "127.0.0.1",
+            "mesen_port": str(DEFAULT_PORT),
+            "mesen_core": core,
+            "mesen_defer_load": "1",
+            "mesen_null_rom": "1",
+        }
+        # Preserve an existing overclock/port choice.
+        if ini_get(gd, "mesen_port"):
+            vals.pop("mesen_port")
+        ini_set(gd, vals)
+        if ini_get(gd, "mesen_overclock_follow") is None:
+            ini_set(gd, {"mesen_overclock_follow": "1",
+                         "mesen_overclock_turbo": "262"})
+        print(f"[20xx] configured mesen_core = {core}")
+
+    host = ensure_host()
+    host_ok = bool(host)
+    if host_ok:
+        print(f"[20xx] Mesen host ready: {host}")
+
+    if not args.no_extract:
+        written = extract(gd, os.path.join(gd, "roms"), None, None, quiet=True)
+        print(f"[20xx] extracted {len(written)} ROM(s) -> {os.path.join(gd, 'roms')}")
+        bad = 0
+        pe = PE(src)
+        for key in GAME_ORDER:
+            g = romtable.GAMES[key]
+            crc = patcher.crc32(patcher.read_prg(pe, g))
+            want = romtable.ORIGINAL_PRG_CRC.get(key)
+            if want is not None and crc != want:
+                bad += 1
+                print(f"  {key:4} CRC {crc:#010x} != {want:#010x} "
+                      "(modified install? run Verify)")
+        if not bad:
+            print(f"[20xx] ROM CRCs match ({len(GAME_ORDER)}/{len(GAME_ORDER)})")
+
+    if args.start and core_ok:
+        start_host(core)
+    elif args.start:
+        print("20xx: --start needs a working core")
+
+    ready = unpack_ok and proxy_ok and core_ok and host_ok
+    print("[20xx] setup " + ("complete - ready to play through Mesen"
+                             if ready else
+                             "finished with missing pieces (see above)"))
+    return 0 if ready else 1
 
 
 def cmd_overclock(args: argparse.Namespace) -> int:
@@ -1374,6 +1619,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
 
     oc_follow = tk.BooleanVar(value=bool(cfg.get("oc_follow", True)))
     oc_turbo = tk.StringVar(value=str(cfg.get("oc_turbo", 262)))
+    auto_build_core = tk.BooleanVar(value=bool(cfg.get("auto_build_core", False)))
     input_vars: dict = {}
     saved_map = cfg.get("input_map", DEFAULT_INPUT_MAP)
     for _key in INPUT_LABELS:
@@ -1495,6 +1741,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
             "steamless": steamless_cli.get().strip(),
             "oc_follow": bool(oc_follow.get()),
             "oc_turbo": oc_turbo.get(),
+            "auto_build_core": bool(auto_build_core.get()),
         })
         gui_config_save(cfg2)
 
@@ -1537,7 +1784,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
         bf.pack(fill="x", padx=12, pady=10)
         ttk.Button(bf, text="+ Add collection",
                    command=lambda: collection_dialog(None)).pack(side="left")
-        ttk.Button(bf, text="Setup / Repair",
+        ttk.Button(bf, text="Automatic setup",
                    command=lambda: run(setup_task)).pack(side="left", padx=6)
         ttk.Label(bf, text="More collections can be registered here; only "
                            "MMLC1 has a game table so far.",
@@ -1676,7 +1923,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
                    command=lambda: run(verify_task)).pack(side="left")
         ttk.Button(bf, text="Open romhacks folder",
                    command=lambda: run(open_romhacks)).pack(side="left", padx=6)
-        ttk.Button(bf, text="Setup / Repair",
+        ttk.Button(bf, text="Automatic setup",
                    command=lambda: run(setup_task)).pack(side="left", padx=6)
 
     # --- Per-game page ------------------------------------------------------
@@ -1954,10 +2201,15 @@ def cmd_gui(args: argparse.Namespace) -> int:
                    ).grid(row=0, column=2, padx=4)
         ttk.Button(f2, text="Build core",
                    command=lambda: run(build_core_task)).grid(row=0, column=3, padx=4)
+        ttk.Checkbutton(f2, text="Automatic setup may build the core if missing "
+                                 "(clone + make)",
+                        variable=auto_build_core).grid(
+                            row=1, column=0, columnspan=4, sticky="w",
+                            padx=8, pady=(0, 6))
 
         f3 = ttk.Frame(body)
         f3.pack(fill="x", padx=12, pady=2)
-        ttk.Button(f3, text="Setup / Repair",
+        ttk.Button(f3, text="Automatic setup",
                    command=lambda: run(setup_task)).pack(side="left")
         ttk.Button(f3, text="Verify install",
                    command=lambda: run(verify_task)).pack(side="left", padx=6)
@@ -2073,20 +2325,16 @@ def cmd_gui(args: argparse.Namespace) -> int:
             logq.put("Set the install folder first.")
             return
         save_runtime()
-        logq.put(f"[20xx] install: {gd}")
-        ensure_proteus_unpacked(gd, steamless_cli.get().strip() or None,
-                                status=lambda m: logq.put(m))
-        src = find_source(gd)
-        logq.put(f"[20xx] ROM source: {os.path.basename(src)}")
-        install_proxy(gd)
-        c = core.get().strip()
+        ns = argparse.Namespace(
+            game_dir=gd,
+            core=core.get().strip() or None,
+            steamless=steamless_cli.get().strip() or None,
+            no_core_build=not auto_build_core.get(),
+            no_extract=False, yes=True, start=False)
+        rc = cmd_setup(ns)
+        c = find_core(gd)
         if c:
-            ini_set(gd, {"mesen": "1", "mesen_host": "127.0.0.1",
-                         "mesen_port": str(DEFAULT_PORT), "mesen_core": c,
-                         "mesen_defer_load": "1", "mesen_null_rom": "1"})
-            logq.put(f"[20xx] mesen core: {c}")
-            if not check_core(c):
-                logq.put("WARNING: core is missing MMLC hooks (see mesen2_capture.patch)")
+            core.set(c)
         try:
             turbo = int(oc_turbo.get().strip() or "262")
         except ValueError:
@@ -2105,13 +2353,8 @@ def cmd_gui(args: argparse.Namespace) -> int:
                      "state_reset_button": rs, "state_turbo_button": tb,
                      "state_slot": state_slot.get().strip() or "0"})
         logq.put(f"[20xx] state hotkeys: save={sv} load={ld} reset={rs} turbo={tb}")
-        host = ensure_host()
-        if host:
-            logq.put(f"[20xx] mesen_host: {host}")
-        written = extract(gd, os.path.join(gd, "roms"), None, None, quiet=True)
-        logq.put(f"[20xx] extracted {len(written)} ROM(s) -> {os.path.join(gd, 'roms')}")
         save_config()
-        logq.put("[20xx] setup complete.")
+        logq.put(f"[20xx] automatic setup finished (status {rc}).")
 
     def verify_task():
         gd = game_dir.get().strip()
@@ -2403,7 +2646,7 @@ def build_parser() -> argparse.ArgumentParser:
     mp.set_defaults(func=cmd_mesen)
     up = sub.add_parser("unpack",
                         help="Steamless-unpack Proteus.exe (required for the "
-                             "Mesen runtime hooks; also done by Setup/Repair)")
+                             "Mesen runtime hooks; also done by Automatic setup)")
     up.add_argument("--steamless", default=None, help="path to Steamless.CLI.exe")
     up.add_argument("--force", action="store_true",
                     help="re-unpack even if Proteus.exe is already unpacked")
@@ -2440,6 +2683,24 @@ def build_parser() -> argparse.ArgumentParser:
     bc.add_argument("--dir", default=None, help="where to clone/build Mesen2")
     bc.add_argument("--jobs", type=int, default=None)
     bc.set_defaults(func=cmd_build_core)
+    doc = sub.add_parser("doctor", help="check install, Steamless, proxy, "
+                                        "core, host and ROM readiness")
+    doc.add_argument("--core", default=None, help="MesenCore.so/.dll to check")
+    doc.add_argument("--steamless", default=None, help="Steamless.CLI.exe")
+    doc.set_defaults(func=cmd_doctor)
+    su = sub.add_parser("setup", help="automatic setup: detect install, unpack, "
+                                      "proxy, core, host, ROMs")
+    su.add_argument("--core", default=None, help="use this MesenCore.so/.dll")
+    su.add_argument("--steamless", default=None, help="Steamless.CLI.exe")
+    su.add_argument("--no-core-build", action="store_true",
+                    help="never clone/build Mesen2; only use an existing core")
+    su.add_argument("--no-extract", action="store_true",
+                    help="do not extract/verify ROMs")
+    su.add_argument("--yes", action="store_true",
+                    help="answer yes to prompts (e.g. build the core)")
+    su.add_argument("--start", action="store_true",
+                    help="start the Mesen host when setup succeeds")
+    su.set_defaults(func=cmd_setup)
     sub.add_parser("gui", help="Tk launcher").set_defaults(func=cmd_gui)
     return p
 

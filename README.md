@@ -63,7 +63,7 @@ bytes verbatim, which is exactly what a randomizer expects.
   prebuilt AppImage/exe bundle Python, Tk and the launcher's dependencies.
 - **Steamless v3.1.0.5** (`Steamless.CLI.exe`, runs under `mono`) — required so the
   Mesen proxy's runtime hooks resolve. A clean Steam install ships the
-  SteamStub-packed `Proteus.exe`, which Setup/Repair unpacks. 20XX looks for the
+  SteamStub-packed `Proteus.exe`, which Automatic setup unpacks. 20XX looks for the
   CLI at `tools/steamless/Steamless.CLI.exe`, `~/.cache/mmlc-mesen/steamless/`,
   `$STEAMLESS_CLI`, or a path you pass (`--steamless` / the GUI field).
 - For building the Mesen2 core: `git`, `make`, a C++ toolchain, and Mesen2's
@@ -115,7 +115,14 @@ offline patching, seeding and ROM export.
 ## Install / use
 
 ```bash
-# unpack Proteus.exe (Steamless) + install the proxy, using a Mesen core
+# automatic setup: find the Steam install, unpack Proteus.exe, back up and
+# install the proxy, find/build a core, configure and start the host
+20xx setup --start
+
+# or just check what is missing (read-only, exit 1 when not ready)
+20xx doctor
+
+# manual equivalent, with a core you already built
 20xx mesen --core /path/to/MesenCore.so
 
 # re-unpack after a Steam update/repair replaces Proteus.exe
@@ -140,9 +147,15 @@ and applies the same patch options as `patch`/`play` to the selected game; the
 rest of the set is exported vanilla. Use it to play the patched ROMs in any
 other emulator.
 
-Setup/Repair (and every launch via the Mesen host) unpacks `Proteus.exe` with
-Steamless if it is still SteamStub-packed — a fresh install or Steam repair
-restores the packed exe, which otherwise disables all the runtime hooks.
+Automatic setup (the GUI button and `20xx setup`) follows Steam's
+`libraryfolders.vdf`, so a game library on another drive is found without
+typing the path. It downloads Steamless on first use, unpacks `Proteus.exe` if
+it is still SteamStub-packed, renames Valve's `steam_api.dll` to
+`steam_api_orig.dll` before installing the proxy, and extracts/verifies the 12
+ROMs. A fresh install or Steam repair restores the packed exe and Valve DLL, so
+re-run setup after verifying files. On Linux, add `--yes` to let it clone and
+build Mesen2 when no core is found (or tick the GUI checkbox); on Windows a
+user-built `MesenCore.dll` is still required.
 
 Steam pre-launch hook (Steam → Properties → Launch Options):
 
