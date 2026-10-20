@@ -76,7 +76,24 @@ os.makedirs(BUILD_DIR, exist_ok=True)
 from mmlc import hardmode, patcher, randomizer, romhack, romtable, steamless, wily
 from mmlc.pe import PE, write_file_atomic
 
-DEFAULT_GAME_DIR = "/var/home/user/.local/share/Steam/steamapps/common/Suzy"
+_WIN = sys.platform.startswith("win")
+
+
+def _default_game_dir() -> str:
+    if _WIN:
+        bases = [os.environ.get("ProgramFiles(x86)"),
+                 os.environ.get("ProgramFiles")]
+        for base in bases:
+            if base:
+                p = os.path.join(base, "Steam", "steamapps", "common", "Suzy")
+                if os.path.isdir(p):
+                    return p
+        return os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                            "Steam", "steamapps", "common", "Suzy")
+    return "/var/home/user/.local/share/Steam/steamapps/common/Suzy"
+
+
+DEFAULT_GAME_DIR = _default_game_dir()
 DEFAULT_APPID = "363440"
 
 # Brand/version shown so it is obvious which build is running.
@@ -85,13 +102,18 @@ VERSION = "0.6.0"
 
 # --- Mesen replacer (optional; the user supplies their own Mesen2 core) ------
 HOST_SRC = os.path.join(BUNDLE, "tools", "mesen_host", "mesen_host.c")
-# A host prebuilt into the bundle (release AppImage) is used as-is; otherwise
-# build it on first use into the writable BUILD_DIR.
-_BUNDLED_HOST = next((p for p in (os.path.join(ROOT, "build", "mesen_host"),
-                                  os.path.join(BUNDLE, "build", "mesen_host"))
+HOST_BIN = "mesen_host.exe" if _WIN else "mesen_host"
+# A host prebuilt into the bundle (release AppImage/exe) is used as-is;
+# otherwise build it on first use into the writable BUILD_DIR.
+_BUNDLED_HOST = next((p for p in (os.path.join(ROOT, "build", HOST_BIN),
+                                  os.path.join(BUNDLE, "build", HOST_BIN))
                       if os.path.exists(p)), None)
-HOST_BUILD = _BUNDLED_HOST or os.path.join(BUILD_DIR, "mesen_host")
+# Always run the host from the writable cache, never from a read-only AppImage
+# mount or PyInstaller's temporary _MEIPASS (which may be cleaned up while the
+# detached host is still running).
+HOST_BUILD = os.path.join(BUILD_DIR, HOST_BIN)
 PROXY_BUILD = next((p for p in (os.path.join(BUNDLE, "build", "steam_api.dll"),
+                                os.path.join(ROOT, "build", "steam_api.dll"),
                                 os.path.join(BUILD_DIR, "steam_api.dll"))
                     if os.path.exists(p)),
                    os.path.join(BUILD_DIR, "steam_api.dll"))
@@ -109,6 +131,16 @@ CORE_SEARCH = [
     os.path.join(ROOT, "build", "MesenCore.so"),
     os.path.join(ROOT, "MesenCore.so"),
 ]
+if _WIN:
+    _mesen2 = os.path.expanduser("~/.cache/mmlc-mesen/Mesen2")
+    CORE_SEARCH = [
+        os.path.join(BUILD_DIR, "MesenCore.dll"),
+        os.path.join(ROOT, "build", "MesenCore.dll"),
+        os.path.join(ROOT, "MesenCore.dll"),
+        os.path.join(_mesen2, "InteropDLL", "bin", "x64", "Release", "MesenCore.dll"),
+        os.path.join(_mesen2, "InteropDLL", "bin", "Release", "MesenCore.dll"),
+        os.path.join(_mesen2, "InteropDLL", "x64", "Release", "MesenCore.dll"),
+    ]
 # Exports the host needs from the core (added by tools/mesen_host/mesen2_capture.patch).
 CORE_REQUIRED_EXPORTS = [
     "InitDll", "InitializeEmu", "LoadRom", "EnableCaptureRenderer",
@@ -489,6 +521,14 @@ def verify(game_dir: str, source: Optional[str] = None) -> int:
 
 
 def launch(appid: str = DEFAULT_APPID, status=print) -> None:
+    if _WIN:
+        status(f"[20xx] steam://rungameid/{appid}")
+        try:
+            os.startfile(f"steam://rungameid/{appid}")  # type: ignore[attr-defined]
+            status("[20xx] launch requested (collection should open)")
+        except OSError as ex:
+            status(f"20xx: launch failed: {ex}")
+        return
     try:
         if subprocess.run(["pgrep", "-x", "Proteus.exe"],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -588,6 +628,9 @@ def check_core(core: str) -> bool:
         print(f"20xx: core not found: {core}")
         return False
     try:
+        if _WIN and hasattr(os, "add_dll_directory"):
+            # Let the loader find dependent DLLs shipped beside MesenCore.dll.
+            os.add_dll_directory(os.path.dirname(os.path.abspath(core)))
         lib = ctypes.CDLL(core)
     except OSError as ex:
         print(f"20xx: cannot load core: {ex}")
@@ -602,6 +645,22 @@ def check_core(core: str) -> bool:
 
 
 def ensure_host() -> Optional[str]:
+    if _BUNDLED_HOST:
+        try:
+            stale = (not os.path.exists(HOST_BUILD)
+                     or os.path.getsize(HOST_BUILD) != os.path.getsize(_BUNDLED_HOST)
+                     or os.path.getmtime(HOST_BUILD) < os.path.getmtime(_BUNDLED_HOST))
+        except OSError:
+            stale = True
+        if stale:
+            import shutil
+            os.makedirs(os.path.dirname(HOST_BUILD), exist_ok=True)
+            try:
+                shutil.copy2(_BUNDLED_HOST, HOST_BUILD)
+                os.chmod(HOST_BUILD, 0o755)
+                print(f"20xx: host installed -> {HOST_BUILD}")
+            except OSError as ex:
+                print(f"20xx: cannot install bundled host: {ex}")
     if os.path.exists(HOST_BUILD):
         return HOST_BUILD
     if not os.path.exists(HOST_SRC):
@@ -609,8 +668,21 @@ def ensure_host() -> Optional[str]:
         return None
     os.makedirs(os.path.dirname(HOST_BUILD), exist_ok=True)
     print(f"20xx: building host -> {HOST_BUILD}")
-    rc = subprocess.call(["cc", "-O2", "-o", HOST_BUILD, HOST_SRC, "-ldl", "-lpthread"])
-    return HOST_BUILD if rc == 0 else None
+    if _WIN:
+        # Release zips bundle mesen_host.exe; this fallback is for source runs
+        # with a MinGW-w64 toolchain on PATH.
+        cmd = ["gcc", "-O2", "-o", HOST_BUILD, HOST_SRC, "-lws2_32"]
+    else:
+        cmd = ["cc", "-O2", "-o", HOST_BUILD, HOST_SRC, "-ldl", "-lpthread"]
+    try:
+        rc = subprocess.call(cmd)
+    except FileNotFoundError:
+        print("20xx: no C compiler found; use a release build or install "
+              + ("MinGW-w64" if _WIN else "a C compiler"))
+        return None
+    if rc != 0:
+        return None
+    return HOST_BUILD if os.path.exists(HOST_BUILD) else None
 
 
 def _mesen_patch_applied(dest: str) -> bool:
@@ -719,9 +791,16 @@ def start_host(core: str, port: int = DEFAULT_PORT) -> bool:
     log = os.path.join(BUILD_DIR, "mesen_host.log")
     os.makedirs(os.path.dirname(log), exist_ok=True)
     lf = open(log, "ab")
+    kwargs = {}
+    if _WIN:
+        # No console window; new process group so closing 20XX does not kill it.
+        kwargs["creationflags"] = (subprocess.CREATE_NEW_PROCESS_GROUP
+                                   | subprocess.CREATE_NO_WINDOW)
+    else:
+        kwargs["start_new_session"] = True
     subprocess.Popen([host, "--core", core, "--port", str(port)],
                      stdout=lf, stderr=lf, stdin=subprocess.DEVNULL,
-                     start_new_session=True)
+                     **kwargs)
     for _ in range(40):
         if host_running(port):
             print(f"20xx: host started on :{port} (core {os.path.basename(core)})")
@@ -744,7 +823,7 @@ def cmd_mesen(args: argparse.Namespace) -> int:
         print("[20xx] Mesen replacer status:")
         print(f"  mesen     = {ini_get(gd, 'mesen') or '0'}")
         print(f"  mesen_core= {ini_get(gd, 'mesen_core') or '(unset)'}")
-        print("  enable with: 20xx mesen --core /path/to/MesenCore.so")
+        print(f"  enable with: 20xx mesen --core /path/to/MesenCore{'.dll' if _WIN else '.so'}")
         return 0
     if not check_core(core):
         return 1
@@ -978,7 +1057,8 @@ def ensure_mesen_host(game_dir: str) -> bool:
     ensure_proteus_unpacked(game_dir, status=lambda m: print(m, flush=True))
     core = find_core(game_dir)
     if not core:
-        print("[20xx] no Mesen core found; run: 20xx mesen --core /path/MesenCore.so")
+        print("[20xx] no Mesen core found; run: 20xx mesen --core "
+              + ("C:\\path\\MesenCore.dll" if _WIN else "/path/MesenCore.so"))
         return False
     if ini_get(game_dir, "mesen_core") != core:
         ini_set(game_dir, {"mesen_core": core})

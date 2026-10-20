@@ -1,6 +1,10 @@
 /*
- * mesen_host.c -- x86-64 Linux host that runs the Mesen2 core headlessly and
- * exposes it to the x86 proxy (Proteus.exe under Proton) over loopback TCP.
+ * mesen_host.c -- headless host that runs the Mesen2 core and exposes it to
+ * the proxy (Proteus.exe) over loopback TCP.
+ *
+ * Platforms:
+ *   - Linux/x86-64 (dlopen, POSIX sockets)
+ *   - Windows/x86-64 (LoadLibrary, Winsock)  -> mesen_host.exe
  *
  * Built against a Mesen2 core that exports the extra MMLC hooks added by
  * tools/mesen_host/mesen2_capture.patch:
@@ -9,30 +13,50 @@
  *
  * The core runs its own emulation thread (LoadRom starts it), so this host is
  * a thin pump: it publishes the newest frame + RAM mirror into shared memory
- * and services commands from the proxy.
+ * (Linux only; the proxy always fetches over TCP) and services commands from
+ * the proxy.
  *
- * Build:  cc -O2 -o mesen_host mesen_host.c -ldl -lpthread
- * Run:    ./mesen_host --core /path/MesenCore.so [--rom game.nes] [--port 36344]
+ * Build (Linux):   cc -O2 -o mesen_host mesen_host.c -ldl -lpthread
+ * Build (Windows): cl /O2 /Fe:mesen_host.exe mesen_host.c ws2_32.lib
+ *                  or: x86_64-w64-mingw32-gcc -O2 -o mesen_host.exe \
+ *                          mesen_host.c -lws2_32
+ * Run:  ./mesen_host --core /path/MesenCore.so [--rom game.nes] [--port 36344]
+ *       mesen_host.exe --core C:\path\MesenCore.dll [--rom game.nes]
  *
  * GPLv3: this host links the GPLv3 Mesen2 core and is therefore GPLv3; it is
  * kept separate from the MIT-licensed proxy and never linked into Proteus.exe.
  */
-#include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <unistd.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <pthread.h>
-#include <sys/socket.h>
-#include <sys/mman.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
+
+#ifdef _WIN32
+    #define _CRT_SECURE_NO_WARNINGS
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #include <windows.h>
+    #include <direct.h>
+    #include <io.h>
+    typedef SOCKET sock_t;
+    #define BAD_SOCK INVALID_SOCKET
+    #define CLOSE_SOCK closesocket
+#else
+    #include <dlfcn.h>
+    #include <unistd.h>
+    #include <errno.h>
+    #include <signal.h>
+    #include <sys/socket.h>
+    #include <sys/mman.h>
+    #include <netinet/in.h>
+    #include <netinet/tcp.h>
+    #include <arpa/inet.h>
+    #include <fcntl.h>
+    typedef int sock_t;
+    #define BAD_SOCK (-1)
+    #define CLOSE_SOCK close
+#endif
 
 #include "mesen_proto.h"
 
@@ -77,7 +101,8 @@ typedef struct {
 static mesen_api g_api;
 static int g_running = 1;
 
-/* ---- shared memory -------------------------------------------------------- */
+/* ---- shared memory (Linux only; the proxy uses TCP) ----------------------- */
+#ifndef _WIN32
 static mesen_frame_shm *g_frame_shm;
 static mesen_ram_shm *g_ram_shm;
 
@@ -91,31 +116,47 @@ static void *shm_map(const char *name, size_t size)
     if (p == MAP_FAILED) { perror("mmap"); return NULL; }
     return p;
 }
+#endif
+
+#ifndef _WIN32
+static void memory_barrier(void)
+{
+    __sync_synchronize();
+}
+#endif
 
 /* ---- socket helpers ------------------------------------------------------- */
-static int read_full(int fd, void *buf, size_t n)
+static int read_full(sock_t fd, void *buf, size_t n)
 {
     size_t got = 0;
     while (got < n) {
+#ifdef _WIN32
+        int r = recv(fd, (char *)buf + got, (int)(n - got), 0);
+#else
         ssize_t r = read(fd, (char *)buf + got, n - got);
+#endif
         if (r <= 0) return -1;
         got += (size_t)r;
     }
     return 0;
 }
 
-static int write_full(int fd, const void *buf, size_t n)
+static int write_full(sock_t fd, const void *buf, size_t n)
 {
     size_t sent = 0;
     while (sent < n) {
+#ifdef _WIN32
+        int r = send(fd, (const char *)buf + sent, (int)(n - sent), 0);
+#else
         ssize_t r = write(fd, (const char *)buf + sent, n - sent);
+#endif
         if (r <= 0) return -1;
         sent += (size_t)r;
     }
     return 0;
 }
 
-static int send_msg(int fd, uint16_t cmd, uint32_t status,
+static int send_msg(sock_t fd, uint16_t cmd, uint32_t status,
                     const void *payload, uint32_t len)
 {
     mesen_msg_hdr h = { MESEN_PROTO_MAGIC, MESEN_PROTO_VERSION, cmd, len, status };
@@ -127,6 +168,7 @@ static int send_msg(int fd, uint16_t cmd, uint32_t status,
 /* ---- frame / RAM pump ----------------------------------------------------- */
 static void publish_frame(void)
 {
+#ifndef _WIN32
     if (!g_api.GetVideoBuffer || !g_frame_shm) return;
     uint32_t w = 0, h = 0, seq = 0;
     uint32_t *buf = g_api.GetVideoBuffer(&w, &h, &seq);
@@ -138,25 +180,56 @@ static void publish_frame(void)
     g_frame_shm->height = h;
     g_frame_shm->pitch = w;
     g_frame_shm->format = 0; /* 0xAARRGGBB */
-    __sync_synchronize();
+    memory_barrier();
     g_frame_shm->seq++;
+#endif
 }
 
 static void publish_ram(void)
 {
+#ifndef _WIN32
     if (!g_api.GetMemoryValues || !g_ram_shm) return;
     /* MemoryType::NesMemory == 8 in Mesen2's enum */
     g_api.GetMemoryValues(8, 0, 0x800, g_ram_shm->cpu_ram);
-    __sync_synchronize();
+    memory_barrier();
     g_ram_shm->seq++;
+#endif
+}
+
+/* ---- portable temp ROM file ---------------------------------------------- */
+static bool make_temp_path(char *path, size_t cap)
+{
+#ifdef _WIN32
+    char dir[MAX_PATH];
+    if (!GetTempPathA((DWORD)sizeof(dir), dir)) return false;
+    if (!GetTempFileNameA(dir, "mmlc", 0, path)) return false;
+    (void)cap;
+    return true;
+#else
+    snprintf(path, cap, "/tmp/mmlc_mesen_rom_XXXXXX");
+    int fd = mkstemp(path);
+    if (fd < 0) return false;
+    close(fd);
+    return true;
+#endif
+}
+
+static void remove_temp(const char *path)
+{
+#ifdef _WIN32
+    DeleteFileA(path);
+#else
+    unlink(path);
+#endif
 }
 
 /* ---- command handling ----------------------------------------------------- */
-static int handle_load_rom(int fd, const mesen_load_rom *lr, const uint8_t *body)
+static int handle_load_rom(sock_t fd, const mesen_load_rom *lr, const uint8_t *body)
 {
-    char path[] = "/tmp/mmlc_mesen_rom_XXXXXX";
-    int tfd = mkstemp(path);
-    if (tfd < 0) return send_msg(fd, MESEN_CMD_ACK, 1, NULL, 0);
+    char path[512];
+    if (!make_temp_path(path, sizeof(path)))
+        return send_msg(fd, MESEN_CMD_ACK, 1, NULL, 0);
+
     /* body = prg[prg_size] + chr[chr_size] + 16-byte iNES header prefix */
     uint8_t hdr[16] = { 'N', 'E', 'S', 0x1a,
                         (uint8_t)(lr->prg_size / 0x4000),
@@ -164,15 +237,17 @@ static int handle_load_rom(int fd, const mesen_load_rom *lr, const uint8_t *body
                         (uint8_t)(((lr->mapper & 0x0f) << 4) |
                                   (lr->mirroring ? 1 : 0)),
                         (uint8_t)(lr->mapper & 0xf0) };
-    if (write_full(tfd, hdr, 16) != 0) { close(tfd); unlink(path); return -1; }
-    if (lr->prg_size && write_full(tfd, body, lr->prg_size) != 0) { close(tfd); unlink(path); return -1; }
-    if (lr->chr_size && write_full(tfd, body + lr->prg_size, lr->chr_size) != 0) { close(tfd); unlink(path); return -1; }
-    close(tfd);
+    FILE *f = fopen(path, "wb");
+    if (!f) { remove_temp(path); return send_msg(fd, MESEN_CMD_ACK, 1, NULL, 0); }
+    bool ok = fwrite(hdr, 1, 16, f) == 16;
+    if (ok && lr->prg_size) ok = fwrite(body, 1, lr->prg_size, f) == lr->prg_size;
+    if (ok && lr->chr_size) ok = fwrite(body + lr->prg_size, 1, lr->chr_size, f) == lr->chr_size;
+    if (fclose(f) != 0) ok = false;
 
     if (g_api.ConfigureNesInput) g_api.ConfigureNesInput();
     if (g_api.FlushAudioCapture) g_api.FlushAudioCapture();
-    bool ok = g_api.LoadRom(path, NULL);
-    unlink(path);
+    if (ok) ok = g_api.LoadRom(path, NULL);
+    remove_temp(path);
     fprintf(stderr, "[mesen_host] load_rom prg=%u chr=%u mapper=%u -> %d\n",
             lr->prg_size, lr->chr_size, lr->mapper, ok);
     /* The debugger (GetMemoryValues / SetControllerState) requires a loaded
@@ -182,7 +257,7 @@ static int handle_load_rom(int fd, const mesen_load_rom *lr, const uint8_t *body
     return send_msg(fd, MESEN_CMD_ACK, ok ? 0 : 1, NULL, 0);
 }
 
-static void serve_client(int fd)
+static void serve_client(sock_t fd)
 {
     for (;;) {
         mesen_msg_hdr h;
@@ -300,39 +375,89 @@ static void serve_client(int fd)
     }
 }
 
+/* ---- dynamic loading ------------------------------------------------------ */
+#ifdef _WIN32
+static HMODULE load_core(const char *path)
+{
+    char dir[MAX_PATH];
+    strncpy(dir, path, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = 0;
+    char *slash = strrchr(dir, '\\');
+    char *fwd = strrchr(dir, '/');
+    if (fwd > slash) slash = fwd;
+    if (slash) {
+        *slash = 0;
+        SetDllDirectoryA(dir);
+    }
+    HMODULE h = LoadLibraryA(path);
+    SetDllDirectoryA(NULL);
+    if (!h)
+        fprintf(stderr, "LoadLibrary(%s) failed: %lu\n", path,
+                (unsigned long)GetLastError());
+    return h;
+}
+#define load_symbol(h, n) ((void *)GetProcAddress((HMODULE)(h), (n)))
+#else
+static void *load_core(const char *path)
+{
+    void *h = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!h) fprintf(stderr, "dlopen: %s\n", dlerror());
+    return h;
+}
+#define load_symbol(h, n) dlsym((h), (n))
+#endif
+
 static int load_api(void *core)
 {
-    g_api.InitDll = (fn_void)dlsym(core, "InitDll");
-    g_api.InitializeEmu = (fn_init)dlsym(core, "InitializeEmu");
-    g_api.EnableCaptureRenderer = (fn_capture)dlsym(core, "EnableCaptureRenderer");
-    g_api.LoadRom = (fn_loadrom)dlsym(core, "LoadRom");
-    g_api.IsRunning = (fn_bool)dlsym(core, "IsRunning");
-    g_api.Stop = (fn_void)dlsym(core, "Stop");
-    g_api.Release = (fn_void)dlsym(core, "Release");
-    g_api.GetVideoBuffer = (fn_video)dlsym(core, "GetVideoBuffer");
-    g_api.GetMemoryValues = (fn_getmems)dlsym(core, "GetMemoryValues");
-    g_api.SaveState = (fn_state)dlsym(core, "SaveState");
-    g_api.LoadState = (fn_state)dlsym(core, "LoadState");
-    g_api.InitializeDebugger = (fn_dbg)dlsym(core, "InitializeDebugger");
-    g_api.SetControllerState = (fn_setinput)dlsym(core, "SetControllerState");
-    g_api.ConfigureNesInput = (fn_void)dlsym(core, "ConfigureNesInput");
-    g_api.ResetConsole = (fn_void)dlsym(core, "ResetConsole");
-    g_api.SetEmulationSpeed = (fn_u32)dlsym(core, "SetEmulationSpeed");
-    g_api.Pause = (fn_void)dlsym(core, "Pause");
-    g_api.Resume = (fn_void)dlsym(core, "Resume");
-    g_api.SetNesOverclock = (fn_u32)dlsym(core, "SetNesOverclock");
-    g_api.EnableCaptureAudio = (fn_capture)dlsym(core, "EnableCaptureAudio");
-    g_api.GetAudioBuffer = (fn_audio)dlsym(core, "GetAudioBuffer");
-    g_api.FlushAudioCapture = (fn_void)dlsym(core, "FlushAudioCapture");
+    g_api.InitDll = (fn_void)load_symbol(core, "InitDll");
+    g_api.InitializeEmu = (fn_init)load_symbol(core, "InitializeEmu");
+    g_api.EnableCaptureRenderer = (fn_capture)load_symbol(core, "EnableCaptureRenderer");
+    g_api.LoadRom = (fn_loadrom)load_symbol(core, "LoadRom");
+    g_api.IsRunning = (fn_bool)load_symbol(core, "IsRunning");
+    g_api.Stop = (fn_void)load_symbol(core, "Stop");
+    g_api.Release = (fn_void)load_symbol(core, "Release");
+    g_api.GetVideoBuffer = (fn_video)load_symbol(core, "GetVideoBuffer");
+    g_api.GetMemoryValues = (fn_getmems)load_symbol(core, "GetMemoryValues");
+    g_api.SaveState = (fn_state)load_symbol(core, "SaveState");
+    g_api.LoadState = (fn_state)load_symbol(core, "LoadState");
+    g_api.InitializeDebugger = (fn_dbg)load_symbol(core, "InitializeDebugger");
+    g_api.SetControllerState = (fn_setinput)load_symbol(core, "SetControllerState");
+    g_api.ConfigureNesInput = (fn_void)load_symbol(core, "ConfigureNesInput");
+    g_api.ResetConsole = (fn_void)load_symbol(core, "ResetConsole");
+    g_api.SetEmulationSpeed = (fn_u32)load_symbol(core, "SetEmulationSpeed");
+    g_api.Pause = (fn_void)load_symbol(core, "Pause");
+    g_api.Resume = (fn_void)load_symbol(core, "Resume");
+    g_api.SetNesOverclock = (fn_u32)load_symbol(core, "SetNesOverclock");
+    g_api.EnableCaptureAudio = (fn_capture)load_symbol(core, "EnableCaptureAudio");
+    g_api.GetAudioBuffer = (fn_audio)load_symbol(core, "GetAudioBuffer");
+    g_api.FlushAudioCapture = (fn_void)load_symbol(core, "FlushAudioCapture");
     if (!g_api.InitDll || !g_api.InitializeEmu || !g_api.LoadRom ||
         !g_api.EnableCaptureRenderer || !g_api.GetVideoBuffer)
         return -1;
     return 0;
 }
 
+static const char *default_home(void)
+{
+#ifdef _WIN32
+    static char home[MAX_PATH * 2];
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base || !*base) base = getenv("TEMP");
+    if (!base || !*base) base = ".";
+    char parent[MAX_PATH];
+    snprintf(parent, sizeof(parent), "%s\\20XX", base);
+    snprintf(home, sizeof(home), "%s\\mesen_home", parent);
+    _mkdir(parent);
+    _mkdir(home);
+    return home;
+#else
+    return "/tmp/mmlc_mesen_home";
+#endif
+}
+
 int main(int argc, char **argv)
 {
-    const char *core_path = NULL, *rom = NULL, *home = "/tmp/mmlc_mesen_home";
+    const char *core_path = NULL, *rom = NULL, *home = NULL;
     int port = MESEN_DEFAULT_PORT;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--core") && i + 1 < argc) core_path = argv[++i];
@@ -340,8 +465,20 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--home") && i + 1 < argc) home = argv[++i];
     }
-    if (!core_path) { fprintf(stderr, "usage: %s --core MesenCore.so [--rom x.nes] [--port n]\n", argv[0]); return 2; }
+    if (!core_path) {
+        fprintf(stderr, "usage: %s --core MesenCore(.so|.dll) [--rom x.nes] "
+                        "[--port n] [--home dir]\n", argv[0]);
+        return 2;
+    }
+    if (!home) home = default_home();
 
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "WSAStartup failed\n");
+        return 1;
+    }
+#else
     signal(SIGPIPE, SIG_IGN);
 
     g_frame_shm = shm_map(MESEN_FRAME_SHM,
@@ -350,9 +487,10 @@ int main(int argc, char **argv)
     if (!g_frame_shm || !g_ram_shm) return 1;
     g_frame_shm->seq = 0;
     g_ram_shm->seq = 0;
+#endif
 
-    void *core = dlopen(core_path, RTLD_NOW | RTLD_LOCAL);
-    if (!core) { fprintf(stderr, "dlopen: %s\n", dlerror()); return 1; }
+    void *core = load_core(core_path);
+    if (!core) return 1;
     if (load_api(core) != 0) { fprintf(stderr, "core is missing MMLC capture hooks\n"); return 1; }
 
     g_api.InitDll();
@@ -366,25 +504,37 @@ int main(int argc, char **argv)
         if (g_api.InitializeDebugger) g_api.InitializeDebugger();
     }
 
-    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    sock_t srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv == BAD_SOCK) { fprintf(stderr, "socket failed\n"); return 1; }
     int one = 1;
-    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    setsockopt(srv, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    struct sockaddr_in addr = { 0 };
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+    setsockopt(srv, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((uint16_t)port);
-    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0) { perror("bind"); return 1; }
+    if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "bind 127.0.0.1:%d failed\n", port);
+        return 1;
+    }
     listen(srv, 1);
-    fprintf(stderr, "[mesen_host] 20XX-0.5 listening on 127.0.0.1:%d\n", port);
+    fprintf(stderr, "[mesen_host] 20XX listening on 127.0.0.1:%d\n", port);
 
     while (g_running) {
-        int cfd = accept(srv, NULL, NULL);
-        if (cfd < 0) { if (errno == EINTR) continue; break; }
-        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        sock_t cfd = accept(srv, NULL, NULL);
+        if (cfd == BAD_SOCK) {
+#ifdef _WIN32
+            if (WSAGetLastError() == WSAEINTR) continue;
+#else
+            if (errno == EINTR) continue;
+#endif
+            break;
+        }
+        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
         fprintf(stderr, "[mesen_host] client connected\n");
         serve_client(cfd);
-        close(cfd);
+        CLOSE_SOCK(cfd);
         /* The game disconnected: stop emulating so the last game doesn't keep
          * running in the background, but stay up in case the proxy reconnects. */
         if (g_running && g_api.Stop)
@@ -393,5 +543,8 @@ int main(int argc, char **argv)
 
     if (g_api.Stop) g_api.Stop();
     if (g_api.Release) g_api.Release();
+#ifdef _WIN32
+    WSACleanup();
+#endif
     return 0;
 }

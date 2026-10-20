@@ -41,10 +41,16 @@ hiddenimports = [
     "mmlc.wily",
 ]
 
+# Bundle a prebuilt Mesen host when the build produced one (release CI does;
+# source builds can still compile it on first use into BUILD_DIR).
+_host_bin = "mesen_host.exe" if os.name == "nt" else "mesen_host"
+_host_path = os.path.join(ROOT, "build", _host_bin)
+binaries = [(_host_path, "build")] if os.path.exists(_host_path) else []
+
 a = Analysis(
     [os.path.join(ROOT, "tools", "20xx", "20xx.py")],
     pathex=[os.path.join(ROOT, "tools")],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

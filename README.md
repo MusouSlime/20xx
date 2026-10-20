@@ -33,6 +33,9 @@ bytes verbatim, which is exactly what a randomizer expects.
   aren't located yet.
 - **Drop-in ROM-hack folder:** put `.ips`/`.bps` patches under
   `romhacks/<game>/` and 20XX applies them when it patches the ROM.
+- **Windows Mesen host:** the x86-64 host is portable (Winsock/`LoadLibrary`)
+  and ships as `mesen_host.exe` in the Windows release. The core and proxy are
+  still user-supplied.
 - **MM1 extras:** victory lap (max Wily damage), boss doors tinted by their
   weakness, a stage-select portrait tint + green top-buster marker, hard mode
   (damage taken ×2 / dealt ÷1.5), OHKO, and a byte-exact vanilla-Wily restore.
@@ -98,14 +101,16 @@ GitHub Releases ships two bundles built from the tagged source:
 | Platform | File | What works |
 |---|---|---|
 | Linux x86_64 | `20XX-<tag>-x86_64.AppImage` | GUI/CLI, offline patching, Mesen host (bundled) |
-| Windows x64 | `20XX-<tag>-win64.zip` | GUI/CLI, offline patching, seeding and ROM export |
+| Windows x64 | `20XX-<tag>-win64.zip` | GUI/CLI, offline patching/export, Mesen host (bundled) |
 
 Neither bundle contains ROMs, game assets, Steamless, the Mesen2 core or the
-`steam_api.dll` proxy. On Linux, Mesen mode still needs (1) a core built with
-`tools/mesen_host/mesen2_capture.patch` (`20xx build-core`) and (2) the proxy
-built once from your own install (`build/build_proxy.sh`, needs mingw-w64).
-The Windows build is for offline patching/exporting in this release; the Mesen
-host is Linux-only.
+`steam_api.dll` proxy. On both platforms, Mesen mode still needs (1) a core
+built with `tools/mesen_host/mesen2_capture.patch` (`20xx build-core` on Linux;
+`InteropDLL` from `Mesen.sln` on Windows) and (2) the proxy built once from
+your own install (`build/build_proxy.sh`, needs bash + mingw-w64; on Windows
+that means MSYS2/Git Bash). The bundled `mesen_host.exe` is ready to run once
+those two pieces exist. Without Mesen mode, the Windows build still does
+offline patching, seeding and ROM export.
 
 ## Install / use
 
@@ -169,7 +174,7 @@ headerless patches.
 
 ```
 tools/20xx/        the launcher (CLI + Tk GUI + Steam prelaunch)
-tools/mesen_host/  x64 Linux host + mesen2_capture.patch
+tools/mesen_host/  x64 Linux/Windows host + mesen2_capture.patch
 tools/mmlc/        toolkit: PE reader, ROM table, randomizer, IPS/BPS, data.pie
 src/proxy/         steam_api.dll proxy (video/input/audio bridge + hooks)
 docs/              reverse-engineering notes and status

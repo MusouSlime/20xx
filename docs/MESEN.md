@@ -1,14 +1,15 @@
 # Phase 6 — Mesen core (replace the Eclipse NES emulator)
 
-> **Status (rev 3, 2026-10-07):** the Mesen core is now wired for **all 12 ROMs**
+> **Status (rev 4, 2026-10-20):** the Mesen core is wired for **all 12 ROMs**
 > (US Mega Man 1-6 + JP Rockman 1-6), driven by the **20xx** launcher
 > (`tools/20xx/20xx.py`). 20xx extracts the legal ROMs from the user's own
 > `Proteus.exe` into `roms/<key>.nes` and launches MMLC; the proxy hands each
 > game's `.nes` to the host and silences the engine with a size-matched idle
 > ROM. The Mesen replacer is an **option** of 20xx and the user supplies their
-> own `MesenCore.so` (`20xx mesen --core PATH`). The in-engine randomizer and
-> its Museum menu were removed and `data.pie` reverted. See `HANDOFF.md` for
-> the live state.
+> own `MesenCore.so` / `MesenCore.dll` (`20xx mesen --core PATH`). The
+> **x86-64 host now builds and runs on Windows as well as Linux**; release
+> bundles ship the host binary, while the core and proxy remain user-supplied.
+> See `HANDOFF.md` for the live state.
 
 Goal: run the six MMLC NES ROMs (vanilla and randomized) through a **standard,
 well-understood NES core** instead of Digital Eclipse's custom Eclipse core, so
@@ -39,8 +40,8 @@ randomizer expects.
 
 | Topic | Decision |
 |---|---|
-| Core | **Mesen2** (accurate, maintained, x86-64 Linux `.so`) |
-| Process model | **Separate x64 host process** + IPC. `Proteus.exe` is x86 and runs under Proton; the core is x64 Linux ELF, so it cannot be loaded in-process. |
+| Core | **Mesen2** (accurate, maintained, x86-64 `.so` / `.dll`) |
+| Process model | **Separate x64 host process** + IPC. `Proteus.exe` is x86; the core is x64 (ELF on Linux, PE on Windows), so it cannot be loaded in-process. |
 | Linking | The prebuilt `MesenCore.so` renders only to a window, so the recommended path is to **build the Mesen2 core from source** and link our own small host that implements `IRenderingDevice`/`IAudioDevice` to capture frames/audio headlessly. |
 | License | Mesen2 is **GPLv3**. The host is therefore GPLv3 and ships **separately / user-supplied**, loaded at runtime — it is not linked into the MIT-licensed proxy. |
 | ROM source | The proxy hands the ROM/CHR bytes to the host (from `[this+0x810]`/`[this+0x80C]`), so the host never needs a ROM on disk. |
@@ -74,8 +75,8 @@ Video frames reach `IRenderingDevice::UpdateFrame(RenderedFrame&)`; the built-in
 
 ```
  ┌──────────────────────────────┐        IPC (loopback TCP + shm)        ┌────────────────────────────┐
- │ Proteus.exe (x86, Proton)    │  ── load_rom / input / save / command ─▶ │ mesen_host (x64 Linux)     │
- │  steam_api.dll proxy         │                                          │  dlopen/build Mesen2 core  │
+ │ Proteus.exe (x86, Proton)    │  ── load_rom / input / save / command ─▶ │ mesen_host (x64 host)      │
+ │  steam_api.dll proxy         │                                          │  dlopen/LoadLibrary core   │
  │   • hooks NESSystem vtable   │  ◀─ framebuffer / audio / ram / state ── │  custom IRenderingDevice   │
  │   • feeds engine renderer    │                                          │  custom IAudioDevice       │
  └──────────────────────────────┘                                          └────────────────────────────┘
@@ -127,15 +128,31 @@ The patch adds a `CaptureRenderer : IRenderingDevice` and exports
 (InteropDLL), and falls back to the built-in 2C02 palette when the headless
 `NesConfig.UserPalette` is all zero (the GUI normally populates it).
 
-Build and run the host:
+Build and run the host (Linux):
 
 ```bash
 cc -O2 -o mesen_host tools/mesen_host/mesen_host.c -ldl -lpthread
 ./mesen_host --core MesenCore.so --rom mm1.nes --port 36344
 ```
 
-Verified: the host runs the MMLC ROM headlessly and serves the real title
-screen over the protocol (`GET_FRAME`), plus 2 KB CPU RAM (`GET_RAM`).
+Build the host on Windows (x86-64) with MinGW-w64, or use the prebuilt
+`mesen_host.exe` in the release zip:
+
+```bat
+x86_64-w64-mingw32-gcc -O2 -o mesen_host.exe mesen_host.c -lws2_32
+mesen_host.exe --core C:\path\MesenCore.dll --rom mm1.nes --port 36344
+```
+
+The same source uses Winsock + `LoadLibrary` on Windows and POSIX sockets +
+`dlopen` on Linux. Frames/RAM are always fetched over TCP; the POSIX shared
+memory mirror is Linux-only and optional. The host directory containing
+`MesenCore.dll` is added to the DLL search path, so dependent DLLs shipped
+beside the core resolve.
+
+Verified (Linux, rev 4): the host runs the MMLC ROM headlessly and serves the
+real title screen over the protocol (`GET_FRAME`, 256x240), plus 2 KB CPU RAM
+(`GET_RAM`). The Windows binary cross-compiles cleanly; runtime validation
+needs a Windows core/proxy pair.
 
 ## Milestones
 
@@ -220,6 +237,11 @@ Video, input and performance are working end-to-end. Key facts:
   calls onto Mesen `SaveState`/`LoadState`.
 - **M6.6 Hardening:** per-game mapper config, CHR handling, latency/tearing
   tuning, fallback to the Eclipse core on any failure (fail closed).
+- **M6.7 Windows host: DONE (build + bundle).** `mesen_host.c` is portable
+  (Winsock/`LoadLibrary` vs POSIX/`dlopen`); CI cross-compiles
+  `mesen_host.exe`, PyInstaller bundles it, and `20xx` starts it with
+  `CREATE_NO_WINDOW`. Windows still needs a user-built `MesenCore.dll` and
+  the `steam_api.dll` proxy.
 
 ## Feasibility spike results (2026-10-06)
 
@@ -271,7 +293,7 @@ exactly what Phase 6 removes. This path is viable.
 ## Build layout
 
 ```
-tools/mesen_host/           x64 Linux host (GPLv3, user-supplied core)
+tools/mesen_host/           x64 Linux/Windows host (GPLv3, user-supplied core)
   mesen_host.c              entry point, arg parsing, IPC loop
   mesen_proto.h             shared IPC protocol (also included by the proxy)
   capture_renderer.{h,cpp}  custom IRenderingDevice  (needs Mesen2 source)
