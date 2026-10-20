@@ -25,7 +25,7 @@ from mmlc import (
     __version__,
     canary,
     config,
-    locale as locale_mod,
+    locale_mod,
     menudb,
     patcher,
     randomizer,
@@ -564,8 +564,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-weapons", action="store_true")
     sp.add_argument("--no-palette", action="store_true",
                     help="do not randomise Mega Man's palette from the seed")
-    sp.add_argument("--visualizer", action="store_true",
-                    help="apply the stage-select weakness visualizer patch")
+    sp.add_argument("--visualizer", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="apply the stage-select weakness visualizer patch "
+                         "(MM1, always on for stage colors + green marker)")
     sp.add_argument("--password", help="data.pie password")
     sp.add_argument("--sevenz", help="path to 7z executable")
     sp.add_argument("--apply", action="store_true")
