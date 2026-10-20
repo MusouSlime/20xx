@@ -33,6 +33,9 @@ bytes verbatim, which is exactly what a randomizer expects.
   aren't located yet.
 - **Drop-in ROM-hack folder:** put `.ips`/`.bps` patches under
   `romhacks/<game>/` and 20XX applies them when it patches the ROM.
+- **MM1 extras:** victory lap (max Wily damage), boss doors tinted by their
+  weakness, a stage-select portrait tint + green top-buster marker, hard mode
+  (damage taken ×2 / dealt ÷1.5), OHKO, and a byte-exact vanilla-Wily restore.
 - **Export for other emulators:** `20xx export` writes the 12 ROMs (patched
   where selected) to `~/MMLC-ROMs` with friendly names, for use in any emulator.
 - **Save-state hotkeys** (Mesen mode): **LB+Y** saves, **LB+B** loads,
@@ -49,7 +52,8 @@ bytes verbatim, which is exactly what a randomizer expects.
 ## Requirements
 
 - Steam **Mega Man Legacy Collection 1** installed (appid 363440).
-- **Python 3.9+** (stdlib only; `tkinter` for the GUI).
+- **Python 3.9+** (stdlib only; `tkinter` for the GUI) when running from a
+  source checkout. The prebuilt AppImage/exe bundle Python and Tk.
 - **Steamless v3.1.0.5** (`Steamless.CLI.exe`, runs under `mono`) — required so the
   Mesen proxy's runtime hooks resolve. A clean Steam install ships the
   SteamStub-packed `Proteus.exe`, which Setup/Repair unpacks. 20XX looks for the
@@ -82,6 +86,22 @@ Or let 20XX do it (clone + patch + build), then point `mesen_core` at it:
 
 On Windows, apply the same patch and build `InteropDLL` (x64) from
 `Mesen.sln` to get `MesenCore.dll`; then run `20xx mesen --core ...\MesenCore.dll`.
+
+## Prebuilt releases
+
+GitHub Releases ships two bundles built from the tagged source:
+
+| Platform | File | What works |
+|---|---|---|
+| Linux x86_64 | `20XX-<tag>-x86_64.AppImage` | GUI/CLI, offline patching, Mesen host (bundled) |
+| Windows x64 | `20XX-<tag>-win64.zip` | GUI/CLI, offline patching, seeding and ROM export |
+
+Neither bundle contains ROMs, game assets, Steamless, the Mesen2 core or the
+`steam_api.dll` proxy. On Linux, Mesen mode still needs (1) a core built with
+`tools/mesen_host/mesen2_capture.patch` (`20xx build-core`) and (2) the proxy
+built once from your own install (`build/build_proxy.sh`, needs mingw-w64).
+The Windows build is for offline patching/exporting in this release; the Mesen
+host is Linux-only.
 
 ## Install / use
 
@@ -149,6 +169,8 @@ tools/mesen_host/  x64 Linux host + mesen2_capture.patch
 tools/mmlc/        toolkit: PE reader, ROM table, randomizer, IPS/BPS, data.pie
 src/proxy/         steam_api.dll proxy (video/input/audio bridge + hooks)
 docs/              reverse-engineering notes and status
+packaging/         PyInstaller spec, AppImage files, icon
+.github/workflows/ release build (AppImage + Windows exe)
 test/              unit tests
 ```
 

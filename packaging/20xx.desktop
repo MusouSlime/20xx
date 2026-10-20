@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=20XX
+GenericName=Mega Man Legacy Collection launcher
+Comment=Run MMLC1 through Mesen2, randomize ROMs and apply ROM hacks
+Exec=20XX
+Icon=20xx
+Terminal=false
+Categories=Game;Utility;
+Keywords=megaman;rockman;mmlc;randomizer;mesen;
+StartupWMClass=20XX

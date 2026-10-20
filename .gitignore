@@ -16,3 +16,9 @@ data.pie
 data.pie.*
 *.bak
 *.ipsadjust
+
+# Packaging / frozen builds
+dist/
+AppDir/
+build/20xx/
+*.AppImage

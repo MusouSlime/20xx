@@ -22,8 +22,8 @@ if [[ ! -f "$STEAM_API" ]]; then
     exit 1
 fi
 
-mkdir -p "$ROOT/build"
-DEF="$ROOT/build/${ORIG_NAME}_proxy.def"
+mkdir -p "$ROOT/build" "$(dirname "$OUT")"
+DEF="$(dirname "$OUT")/${ORIG_NAME}_proxy.def"
 python3 "$ROOT/build/gen_def.py" "$STEAM_API" "$ORIG_NAME" > "$DEF"
 
 echo "== building $OUT =="

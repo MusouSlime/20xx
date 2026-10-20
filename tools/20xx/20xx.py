@@ -35,6 +35,8 @@ Patch options (for `patch` and `play`):
     --door-palette      tint each MM1 boss door with its weakness color
     --vanilla-wily      keep the MM1 Wily-stage damage rows vanilla
     --cursor-tint       tint the selected stage-select portrait (MM1)
+    --hard-mode         MM1 hard mode (damage received x2, dealt /1.5)
+    --ohko              MM1 one-hit kills (both directions)
     --romhack FILE      apply an IPS/BPS ROM hack (repeatable)
     --ips-adjust N      add N to IPS offsets (-16 = headerless patch)
 
@@ -53,9 +55,23 @@ import subprocess
 import sys
 from typing import Dict, List, Optional
 
+# --- Frozen vs. source-tree layout ---------------------------------------
+# `BUNDLE` is the read-only resource root (the repo, or PyInstaller's _MEIPASS).
+# `BUILD_DIR` is writable (built host/proxy, logs): <repo>/build in a checkout,
+# ~/.cache/mmlc-mesen/build in a frozen AppImage/exe (which may be read-only).
+FROZEN = bool(getattr(sys, "frozen", False))
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(HERE))
-sys.path.insert(0, os.path.join(ROOT, "tools"))
+if FROZEN:
+    BUNDLE = os.path.abspath(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)))
+    ROOT = os.path.dirname(os.path.abspath(sys.executable))
+    BUILD_DIR = os.environ.get(
+        "MMLC_BUILD_DIR", os.path.expanduser("~/.cache/mmlc-mesen/build"))
+else:
+    ROOT = os.path.dirname(os.path.dirname(HERE))
+    BUNDLE = ROOT
+    BUILD_DIR = os.environ.get("MMLC_BUILD_DIR", os.path.join(ROOT, "build"))
+sys.path.insert(0, os.path.join(BUNDLE, "tools"))
+os.makedirs(BUILD_DIR, exist_ok=True)
 
 from mmlc import hardmode, patcher, randomizer, romhack, romtable, steamless, wily
 from mmlc.pe import PE, write_file_atomic
@@ -65,22 +81,31 @@ DEFAULT_APPID = "363440"
 
 # Brand/version shown so it is obvious which build is running.
 APP = "20XX"
-VERSION = "0.5"
+VERSION = "0.6.0"
 
 # --- Mesen replacer (optional; the user supplies their own Mesen2 core) ------
-HOST_SRC = os.path.join(ROOT, "tools", "mesen_host", "mesen_host.c")
-HOST_BUILD = os.path.join(ROOT, "build", "mesen_host")
-PROXY_BUILD = os.path.join(ROOT, "build", "steam_api.dll")
-PROXY_BUILD_SCRIPT = os.path.join(ROOT, "build", "build_proxy.sh")
+HOST_SRC = os.path.join(BUNDLE, "tools", "mesen_host", "mesen_host.c")
+# A host prebuilt into the bundle (release AppImage) is used as-is; otherwise
+# build it on first use into the writable BUILD_DIR.
+_BUNDLED_HOST = next((p for p in (os.path.join(ROOT, "build", "mesen_host"),
+                                  os.path.join(BUNDLE, "build", "mesen_host"))
+                      if os.path.exists(p)), None)
+HOST_BUILD = _BUNDLED_HOST or os.path.join(BUILD_DIR, "mesen_host")
+PROXY_BUILD = next((p for p in (os.path.join(BUNDLE, "build", "steam_api.dll"),
+                                os.path.join(BUILD_DIR, "steam_api.dll"))
+                    if os.path.exists(p)),
+                   os.path.join(BUILD_DIR, "steam_api.dll"))
+PROXY_BUILD_SCRIPT = os.path.join(BUNDLE, "build", "build_proxy.sh")
 DEFAULT_PORT = 36344
 # Mesen2 source + the MMLC capture patch, for `20xx build-core`.
 MESEN2_REPO = "https://github.com/SourMesen/Mesen2.git"
-MESEN2_PATCH = os.path.join(ROOT, "tools", "mesen_host", "mesen2_capture.patch")
+MESEN2_PATCH = os.path.join(BUNDLE, "tools", "mesen_host", "mesen2_capture.patch")
 MESEN2_DEFAULT_DIR = os.path.expanduser("~/.cache/mmlc-mesen/Mesen2")
 # Places to look for a user-supplied Mesen2 core if mmlc.ini has no mesen_core.
 CORE_SEARCH = [
     os.path.expanduser("~/.cache/mmlc-mesen/Mesen2/InteropDLL/obj.linux-x64/MesenCore.so"),
     os.path.expanduser("~/.cache/mmlc-mesen/MesenCore.so"),
+    os.path.join(BUILD_DIR, "MesenCore.so"),
     os.path.join(ROOT, "build", "MesenCore.so"),
     os.path.join(ROOT, "MesenCore.so"),
 ]
@@ -659,6 +684,8 @@ def install_proxy(game_dir: str) -> bool:
     if os.path.exists(PROXY_BUILD_SCRIPT):
         print("20xx: building proxy (needs i686-w64-mingw32-gcc)...")
         env = dict(os.environ)
+        # Never write into a read-only bundle (AppImage); build into BUILD_DIR.
+        env["OUT"] = PROXY_BUILD
         orig = os.path.join(game_dir, "steam_api_orig.dll")
         if os.path.exists(orig):
             env["STEAM_API"] = orig
@@ -689,7 +716,7 @@ def start_host(core: str, port: int = DEFAULT_PORT) -> bool:
     if host_running(port):
         print(f"20xx: host already listening on :{port}")
         return True
-    log = os.path.join(ROOT, "build", "mesen_host.log")
+    log = os.path.join(BUILD_DIR, "mesen_host.log")
     os.makedirs(os.path.dirname(log), exist_ok=True)
     lf = open(log, "ab")
     subprocess.Popen([host, "--core", core, "--port", str(port)],
@@ -2074,6 +2101,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if not getattr(args, "cmd", None):
+        # A double-clicked frozen build (no console stdin) gets the GUI; a
+        # terminal launch keeps the text wizard.
+        if FROZEN and (sys.stdin is None or not sys.stdin.isatty()):
+            return cmd_gui(args)
         return interactive(args)
     return args.func(args)
 

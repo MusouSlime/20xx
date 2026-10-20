@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux AppImage
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Tk
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Check Tk
+        run: python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Unit tests
+        run: python -m unittest discover -s test -v
+
+      - name: Build Mesen host
+        run: cc -O2 -o build/mesen_host tools/mesen_host/mesen_host.c -ldl -lpthread
+
+      - name: Build bundle
+        env:
+          ONEFILE: "0"
+        run: python -m PyInstaller --noconfirm --clean packaging/20xx.spec
+
+      - name: Smoke test bundle
+        run: ./dist/20XX/20XX version
+
+      - name: Assemble AppDir
+        run: |
+          set -eux
+          APPDIR="$PWD/AppDir"
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr/lib" "$APPDIR/usr/share/applications" \
+                   "$APPDIR/usr/share/icons/hicolor/512x512/apps"
+          cp -a dist/20XX "$APPDIR/usr/lib/20xx"
+          mkdir -p "$APPDIR/usr/lib/20xx/build"
+          cp build/mesen_host "$APPDIR/usr/lib/20xx/build/"
+          chmod +x "$APPDIR/usr/lib/20xx/build/mesen_host"
+          cp packaging/AppRun "$APPDIR/AppRun"
+          chmod +x "$APPDIR/AppRun"
+          cp packaging/20xx.desktop "$APPDIR/20xx.desktop"
+          cp packaging/20xx.desktop "$APPDIR/usr/share/applications/20xx.desktop"
+          cp packaging/20xx.png "$APPDIR/20xx.png"
+          cp packaging/20xx.png "$APPDIR/usr/share/icons/hicolor/512x512/apps/20xx.png"
+
+      - name: Build AppImage
+        run: |
+          set -eux
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          NAME="20XX-${GITHUB_REF_NAME}-x86_64.AppImage"
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir "$NAME"
+          APPIMAGE_EXTRACT_AND_RUN=1 ./"$NAME" version
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: 20XX-*-x86_64.AppImage
+          if-no-files-found: error
+
+  windows:
+    name: Windows exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Unit tests
+        run: python -m unittest discover -s test -v
+
+      - name: Build exe
+        env:
+          ONEFILE: "1"
+        run: python -m PyInstaller --noconfirm --clean packaging/20xx.spec
+
+      - name: Smoke test exe
+        run: ./dist/20XX.exe version
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "stage"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item dist/20XX.exe, README.md, LICENSE, packaging/20xx.ico $stage
+          Copy-Item docs/RELEASE_NOTES.md "$stage/RELEASE_NOTES.md"
+          Compress-Archive -Path "$stage/*" -DestinationPath "20XX-${{ github.ref_name }}-win64.zip"
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: 20XX-*-win64.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [linux, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "20XX $GITHUB_REF_NAME" \
+            --notes-file docs/RELEASE_NOTES.md \
+            --latest
