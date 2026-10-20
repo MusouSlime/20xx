@@ -1168,14 +1168,6 @@ GUI_MODES = [
     "Palette shuffle only",
 ]
 
-# Per-game option tabs: (tab title, [US key, JP key], mm1_extra). The
-# `mm1_extra` flag enables the MM1-only boxes (Wily/cursor-tint). Prototype
-# ships MM1/RK1 only; the other pairs slot in the same way as the tab
-# system rolls out.
-GAME_TABS = [
-    ("MM1 / RK1", ["mm1", "rk1"], True),
-]
-
 
 def open_folder(path: str) -> None:
     """Open a folder/file in the OS file manager."""
@@ -1272,27 +1264,68 @@ def cmd_gui(args: argparse.Namespace) -> int:
     import queue
     import threading
 
+    from mmlc import collections as colmod
+
     cfg = gui_config_load()
     logq: "queue.Queue[str]" = queue.Queue()
 
     root = tk.Tk()
     root.title("20XX")
-    root.geometry("800x620")
+    root.geometry("900x760")
     try:
         ttk.Style().theme_use("clam")
     except Exception:
         pass
 
-    game_dir = tk.StringVar(value=cfg.get("game_dir") or args.game_dir or game_dir_default())
+    # --- Global state -------------------------------------------------------
     core = tk.StringVar(value=cfg.get("core") or "")
     steamless_cli = tk.StringVar(value=cfg.get("steamless") or "")
-    # Per-game options live in the tabs (see GAME_TABS); only truly global
-    # settings stay at window scope (install, core, overclock, controls).
+    legacy_dir = cfg.get("game_dir") or args.game_dir or game_dir_default()
+    collections = colmod.normalize(cfg.get("collections"), legacy_dir,
+                                   cfg.get("appid", DEFAULT_APPID))
+    active_id = cfg.get("collection_id") or collections[0]["id"]
+    if not any(c["id"] == active_id for c in collections):
+        active_id = collections[0]["id"]
+    state = {"collections": collections}
+    active = tk.StringVar(value=active_id)
+    game_dir = tk.StringVar(value=next(
+        (c["game_dir"] for c in collections if c["id"] == active_id),
+        legacy_dir))
 
-    # Scrollable content: everything packs into `body` so the window works
-    # at any height without resizing.
+    oc_follow = tk.BooleanVar(value=bool(cfg.get("oc_follow", True)))
+    oc_turbo = tk.StringVar(value=str(cfg.get("oc_turbo", 262)))
+    input_vars: dict = {}
+    saved_map = cfg.get("input_map", DEFAULT_INPUT_MAP)
+    for _key in INPUT_LABELS:
+        input_vars[_key] = tk.StringVar(value=saved_map.get(_key, DEFAULT_INPUT_MAP[_key]))
+    sv_mod, sv_btn = split_state_combo(
+        cfg.get("state_save_button", DEFAULT_SAVE_STATE))
+    ld_mod, ld_btn = split_state_combo(
+        cfg.get("state_load_button", DEFAULT_LOAD_STATE))
+    rs_mod, rs_btn = split_state_combo(
+        cfg.get("state_reset_button", DEFAULT_RESET_STATE))
+    tb_mod, tb_btn = split_state_combo(
+        cfg.get("state_turbo_button", DEFAULT_TURBO_STATE))
+    save_mod, save_btn = tk.StringVar(value=sv_mod), tk.StringVar(value=sv_btn)
+    load_mod, load_btn = tk.StringVar(value=ld_mod), tk.StringVar(value=ld_btn)
+    reset_mod, reset_btn = tk.StringVar(value=rs_mod), tk.StringVar(value=rs_btn)
+    turbo_mod, turbo_btn = tk.StringVar(value=tb_mod), tk.StringVar(value=tb_btn)
+    state_slot = tk.StringVar(value=str(cfg.get("state_slot", 0)))
+
+    # --- Navigation chrome --------------------------------------------------
+    header = ttk.Frame(root)
+    header.pack(fill="x", padx=10, pady=(8, 0))
+    ttk.Label(header, text="20XX", font=("Helvetica", 16, "bold")).pack(side="left")
+    crumb = tk.StringVar(value="Collections")
+    ttk.Label(header, textvariable=crumb, foreground="#6a6a6a").pack(
+        side="left", padx=(10, 0))
+    ttk.Button(header, text="Settings",
+               command=lambda: show_settings()).pack(side="right")
+    ttk.Button(header, text="Collections",
+               command=lambda: show_collections()).pack(side="right", padx=6)
+
     view = ttk.Frame(root)
-    view.pack(fill="both", expand=True)
+    view.pack(fill="both", expand=True, padx=0, pady=(4, 0))
     canvas = tk.Canvas(view, highlightthickness=0)
     vsb = ttk.Scrollbar(view, orient="vertical", command=canvas.yview)
     canvas.configure(yscrollcommand=vsb.set)
@@ -1303,61 +1336,22 @@ def cmd_gui(args: argparse.Namespace) -> int:
     body.bind("<Configure>", lambda _e: canvas.configure(
         scrollregion=canvas.bbox("all")))
 
-    ttk.Label(body, text="20XX", font=("Helvetica", 16, "bold")).pack(pady=(10, 0))
-    ttk.Label(body, text="Mega Man Legacy Collection — Mesen launcher").pack()
+    log = ScrolledText(root, height=8, state="disabled", font=("monospace", 9))
+    log.pack(fill="x", padx=10, pady=(4, 8))
 
-    f1 = ttk.LabelFrame(body, text="1. Install location")
-    f1.pack(fill="x", padx=10, pady=6)
-    ttk.Entry(f1, textvariable=game_dir).grid(row=0, column=0, sticky="ew", padx=6, pady=6)
-    f1.columnconfigure(0, weight=1)
+    def append(msg):
+        log.configure(state="normal")
+        log.insert("end", str(msg) + "\n")
+        log.see("end")
+        log.configure(state="disabled")
 
-    def browse_dir():
-        d = filedialog.askdirectory(initialdir=game_dir.get() or os.path.expanduser("~"))
-        if d:
-            game_dir.set(d)
-            refresh_hacks_all()
-
-    ttk.Button(f1, text="Browse", command=browse_dir).grid(row=0, column=1, padx=4)
-    ttk.Button(f1, text="Auto-detect",
-               command=lambda: (game_dir.set(game_dir_default()), refresh_hacks_all())
-               ).grid(row=0, column=2, padx=4)
-
-    ttk.Label(f1, text="Steamless.CLI.exe").grid(row=1, column=0, sticky="w",
-                                                 padx=6, pady=(0, 6))
-    ttk.Entry(f1, textvariable=steamless_cli).grid(row=2, column=0, sticky="ew",
-                                                   padx=6, pady=(0, 6))
-
-    def browse_steamless():
-        f = filedialog.askopenfilename(
-            initialdir=os.path.expanduser("~"),
-            title="Select Steamless.CLI.exe",
-            filetypes=[("Steamless CLI", "*.exe"), ("All files", "*")])
-        if f:
-            steamless_cli.set(f)
-
-    ttk.Button(f1, text="Browse",
-               command=browse_steamless).grid(row=2, column=1, padx=4, pady=(0, 6))
-    ttk.Button(f1, text="Auto-detect",
-               command=lambda: steamless_cli.set(_detect_steamless() or "")
-               ).grid(row=2, column=2, padx=4, pady=(0, 6))
-
-    f2 = ttk.LabelFrame(body, text="2. Mesen core (user-supplied; GPLv3, not bundled)")
-    f2.pack(fill="x", padx=10, pady=6)
-    ttk.Entry(f2, textvariable=core).grid(row=0, column=0, sticky="ew", padx=6, pady=6)
-    f2.columnconfigure(0, weight=1)
-
-    def browse_core():
-        f = filedialog.askopenfilename(initialdir=os.path.expanduser("~"),
-                                       title="Select MesenCore.so / MesenCore.dll")
-        if f:
-            core.set(f)
-
-    ttk.Button(f2, text="Browse", command=browse_core).grid(row=0, column=1, padx=4)
-    ttk.Button(f2, text="Auto-detect",
-               command=lambda: core.set(find_core(game_dir.get()) or "")
-               ).grid(row=0, column=2, padx=4)
-    ttk.Button(f2, text="Build core",
-               command=lambda: run(build_core_task)).grid(row=0, column=3, padx=4)
+    def pump():
+        try:
+            while True:
+                append(logq.get_nowait())
+        except queue.Empty:
+            pass
+        root.after(100, pump)
 
     class _QWriter:
         def __init__(self):
@@ -1390,44 +1384,259 @@ def cmd_gui(args: argparse.Namespace) -> int:
                 sys.stdout, sys.stderr = old
         threading.Thread(target=wrapper, daemon=True).start()
 
-    f3 = ttk.Frame(body)
-    f3.pack(fill="x", padx=10, pady=2)
-    ttk.Button(f3, text="Setup / Repair", command=lambda: run(setup_task)).pack(side="left")
-    ttk.Button(f3, text="Verify install", command=lambda: run(verify_task)).pack(side="left", padx=6)
+    def clear_page():
+        for w in body.winfo_children():
+            w.destroy()
+        canvas.yview_moveto(0)
 
-    # --- Global overclock (applies to every game) ---
-    fg = ttk.LabelFrame(body, text="3. Overclock (global)")
-    fg.pack(fill="x", padx=10, pady=6)
-    oc_follow = tk.BooleanVar(value=bool(cfg.get("oc_follow", True)))
-    oc_turbo = tk.StringVar(value=str(cfg.get("oc_turbo", 262)))
-    ttk.Checkbutton(fg, text="Follow in-game CPU SPEED",
-                    variable=oc_follow).grid(row=0, column=0, sticky="w",
-                                             padx=6, pady=4)
-    ttk.Label(fg, text="Turbo scanlines").grid(row=0, column=1, sticky="w", padx=6)
-    ttk.Entry(fg, textvariable=oc_turbo, width=8).grid(row=0, column=2,
-                                                       sticky="w", padx=6)
+    def page_title(title, subtitle=""):
+        ttk.Label(body, text=title, font=("Helvetica", 13, "bold")).pack(
+            anchor="w", padx=12, pady=(8, 0))
+        if subtitle:
+            ttk.Label(body, text=subtitle, foreground="#555").pack(
+                anchor="w", padx=12, pady=(0, 6))
 
-    # --- 4. Game tabs (per-game options) ---
-    nb = ttk.Notebook(body)
-    nb.pack(fill="x", padx=10, pady=6)
-    tabs: "list[dict]" = []
+    def active_col() -> dict:
+        for c in state["collections"]:
+            if c["id"] == active.get():
+                return c
+        return state["collections"][0]
 
-    def save_runtime():
-        gd = game_dir.get().strip()
-        if not gd:
+    def save_config():
+        c = active_col()
+        c["game_dir"] = game_dir.get().strip() or c["game_dir"]
+        cfg2 = dict(gui_config_load())
+        cfg2.update({
+            "collections": state["collections"],
+            "collection_id": active.get(),
+            "game_dir": game_dir.get().strip(),
+            "appid": c.get("appid") or DEFAULT_APPID,
+            "core": core.get().strip(),
+            "steamless": steamless_cli.get().strip(),
+            "oc_follow": bool(oc_follow.get()),
+            "oc_turbo": oc_turbo.get(),
+        })
+        gui_config_save(cfg2)
+
+    def use_collection(c: dict):
+        active.set(c["id"])
+        game_dir.set(c["game_dir"])
+        save_config()
+
+    # --- Collection page ----------------------------------------------------
+    def show_collections():
+        clear_page()
+        crumb.set("Collections")
+        page_title("Choose a collection",
+                   "Each collection has its own install folder and game list.")
+        for c in state["collections"]:
+            fr = ttk.LabelFrame(body, text=c["name"])
+            fr.pack(fill="x", padx=12, pady=6)
+            path = c["game_dir"] or "(no folder set)"
+            ttk.Label(fr, text=path, wraplength=760).grid(
+                row=0, column=0, sticky="w", padx=8, pady=(6, 0))
+            kind = colmod.KIND_LABELS.get(c["kind"], c["kind"])
+            n = len(colmod.games(c))
+            status = f"{kind} — {n} game(s)" if n else f"{kind} — no games yet"
+            if c["kind"] == colmod.KIND_MMLC1 and not colmod.has_rom_source(
+                    c["game_dir"]):
+                status += "  (install not found)"
+            ttk.Label(fr, text=status, foreground="#666").grid(
+                row=1, column=0, sticky="w", padx=8)
+            bf = ttk.Frame(fr)
+            bf.grid(row=2, column=0, sticky="w", padx=6, pady=(4, 6))
+            fr.columnconfigure(0, weight=1)
+            ttk.Button(bf, text="Open",
+                       command=lambda c=c: open_collection(c)).pack(side="left")
+            ttk.Button(bf, text="Edit",
+                       command=lambda c=c: collection_dialog(c)).pack(
+                           side="left", padx=4)
+            ttk.Button(bf, text="Remove",
+                       command=lambda c=c: remove_collection(c)).pack(side="left")
+        bf = ttk.Frame(body)
+        bf.pack(fill="x", padx=12, pady=10)
+        ttk.Button(bf, text="+ Add collection",
+                   command=lambda: collection_dialog(None)).pack(side="left")
+        ttk.Button(bf, text="Setup / Repair",
+                   command=lambda: run(setup_task)).pack(side="left", padx=6)
+        ttk.Label(bf, text="More collections can be registered here; only "
+                           "MMLC1 has a game table so far.",
+                  foreground="#666").pack(side="left", padx=8)
+
+    def open_collection(c: dict):
+        use_collection(c)
+        show_games(c)
+
+    def remove_collection(c: dict):
+        state["collections"] = [x for x in state["collections"] if x["id"] != c["id"]]
+        if not state["collections"]:
+            state["collections"] = colmod.normalize([], game_dir.get(),
+                                                    c.get("appid", DEFAULT_APPID))
+        if active.get() == c["id"]:
+            active.set(state["collections"][0]["id"])
+            game_dir.set(state["collections"][0]["game_dir"])
+        save_config()
+        show_collections()
+
+    def collection_dialog(existing):
+        top = tk.Toplevel(root)
+        top.title("Edit collection" if existing else "Add collection")
+        top.transient(root)
+        top.grab_set()
+        initial_path = (existing or {}).get(
+            "game_dir", game_dir.get() or "") or ""
+        initial_kind = (existing or {}).get("kind") or colmod.detect_kind(
+            initial_path)
+        default_name = (existing or {}).get("name") or (
+            os.path.basename(initial_path.rstrip("/\\")) if initial_path else "")
+        name = tk.StringVar(value=default_name)
+        path = tk.StringVar(value=initial_path)
+        labels = list(colmod.KIND_LABELS.values())
+        kind_label = tk.StringVar(value=colmod.KIND_LABELS.get(
+            initial_kind, colmod.KIND_LABELS[colmod.KIND_UNKNOWN]))
+        appid = tk.StringVar(value=(existing or {}).get("appid", DEFAULT_APPID))
+
+        top.geometry("+%d+%d" % (root.winfo_rootx() + 100,
+                                 root.winfo_rooty() + 80))
+        ttk.Label(top, text="Name").grid(row=0, column=0, sticky="e", padx=8, pady=6)
+        ttk.Entry(top, textvariable=name, width=42).grid(
+            row=0, column=1, columnspan=2, sticky="ew", padx=4)
+        ttk.Label(top, text="Folder").grid(row=1, column=0, sticky="e", padx=8)
+        ttk.Entry(top, textvariable=path, width=42).grid(
+            row=1, column=1, sticky="ew", padx=4)
+
+        def browse():
+            d = filedialog.askdirectory(parent=top, initialdir=path.get() or
+                                        os.path.expanduser("~"))
+            if d:
+                path.set(d)
+                if not name.get().strip():
+                    name.set(os.path.basename(d.rstrip("/")) or d)
+                if colmod.detect_kind(d) == colmod.KIND_MMLC1:
+                    kind_label.set(colmod.KIND_LABELS[colmod.KIND_MMLC1])
+
+        ttk.Button(top, text="Browse", command=browse).grid(row=1, column=2, padx=4)
+        ttk.Label(top, text="Type").grid(row=2, column=0, sticky="e", padx=8, pady=6)
+        ttk.Combobox(top, textvariable=kind_label, values=labels,
+                     state="readonly", width=38).grid(
+                         row=2, column=1, columnspan=2, sticky="w", padx=4)
+        ttk.Label(top, text="Steam appid").grid(row=3, column=0, sticky="e", padx=8)
+        ttk.Entry(top, textvariable=appid, width=12).grid(
+            row=3, column=1, sticky="w", padx=4)
+        hint = ttk.Label(top, text="Only MMLC1 collections expose games today; "
+                                   "other types are kept as placeholders.",
+                         foreground="#666")
+        hint.grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=4)
+
+        def save():
+            kind = next((k for k, v in colmod.KIND_LABELS.items()
+                         if v == kind_label.get()), colmod.KIND_UNKNOWN)
+            nm = name.get().strip() or colmod.KIND_LABELS[kind]
+            if existing:
+                existing.update(name=nm, game_dir=path.get().strip(), kind=kind,
+                                appid=appid.get().strip() or DEFAULT_APPID)
+                if existing["id"] == active.get():
+                    game_dir.set(existing["game_dir"])
+            else:
+                taken = {c["id"] for c in state["collections"]}
+                state["collections"].append({
+                    "id": colmod.new_id(nm, taken), "name": nm,
+                    "game_dir": path.get().strip(), "kind": kind,
+                    "appid": appid.get().strip() or DEFAULT_APPID,
+                })
+            save_config()
+            top.destroy()
+            show_collections()
+
+        bf = ttk.Frame(top)
+        bf.grid(row=5, column=0, columnspan=3, sticky="e", padx=8, pady=8)
+        ttk.Button(bf, text="Cancel", command=top.destroy).pack(side="right")
+        ttk.Button(bf, text="Save", command=save).pack(side="right", padx=6)
+        top.columnconfigure(1, weight=1)
+
+    # --- Game list page -----------------------------------------------------
+    def show_games(c: dict):
+        use_collection(c)
+        clear_page()
+        crumb.set(f"Collections / {c['name']}")
+        page_title(c["name"], "Choose a game.")
+        ttk.Button(body, text="< Collections",
+                   command=show_collections).pack(anchor="w", padx=12)
+        keys = colmod.games(c)
+        if not keys:
+            ttk.Label(body, text="This collection has no game table yet.",
+                      foreground="#a33").pack(anchor="w", padx=12, pady=12)
+            ttk.Button(body, text="Edit collection",
+                       command=lambda: collection_dialog(c)).pack(
+                           anchor="w", padx=12)
             return
-        write_input_map(gd, {k: v.get() for k, v in input_vars.items()})
-        ini_set(gd, {"state_save_button": join_state_combo(save_mod.get(), save_btn.get()),
-                     "state_load_button": join_state_combo(load_mod.get(), load_btn.get()),
-                     "state_reset_button": join_state_combo(reset_mod.get(), reset_btn.get()),
-                     "state_slot": state_slot.get().strip() or "0"})
+        grid = ttk.Frame(body)
+        grid.pack(fill="x", padx=12, pady=8)
+        ttk.Label(grid, text="#", width=3).grid(row=0, column=0)
+        ttk.Label(grid, text="Mega Man (US)").grid(row=0, column=1, sticky="w")
+        ttk.Label(grid, text="Rockman (JP)").grid(row=0, column=2, sticky="w")
+        for i in range(6):
+            us, jp = f"mm{i + 1}", f"rk{i + 1}"
+            ttk.Label(grid, text=str(i + 1), width=3).grid(row=i + 1, column=0)
+            for col, key in ((1, us), (2, jp)):
+                if key not in keys:
+                    continue
+                g = romtable.GAMES[key]
+                label = g.title
+                if key in RANDO_GAMES:
+                    label += "  *"
+                ttk.Button(grid, text=label, width=24,
+                           command=lambda k=key: show_game(c, k)).grid(
+                               row=i + 1, column=col, sticky="w", pady=2)
+        ttk.Label(body, text="* = offline randomizer available (US ROMs).",
+                  foreground="#666").pack(anchor="w", padx=12, pady=(4, 8))
+        bf = ttk.Frame(body)
+        bf.pack(fill="x", padx=12, pady=6)
+        ttk.Button(bf, text="Verify install",
+                   command=lambda: run(verify_task)).pack(side="left")
+        ttk.Button(bf, text="Open romhacks folder",
+                   command=lambda: run(open_romhacks)).pack(side="left", padx=6)
+        ttk.Button(bf, text="Setup / Repair",
+                   command=lambda: run(setup_task)).pack(side="left", padx=6)
 
-    def tab_targets(tab):
-        t = tab["v"]["target"].get()
-        return list(tab["keys"]) if t == "both" else [t]
+    # --- Per-game page ------------------------------------------------------
+    game_state: dict = {}
 
-    def tab_opts(tab):
-        v = tab["v"]
+    def vars_for(key: str) -> dict:
+        v = game_state.get(key)
+        if v is None:
+            v = dict(
+                mode=tk.StringVar(value=GUI_MODES[0]),
+                seed=tk.StringVar(value=""),
+                hack=tk.StringVar(value="<none>"),
+                both=tk.BooleanVar(value=False),
+                victory_lap=tk.BooleanVar(value=False),
+                door_palette=tk.BooleanVar(value=False),
+                vanilla_wily=tk.BooleanVar(value=False),
+                cursor_tint=tk.BooleanVar(value=False),
+                hard_mode=tk.BooleanVar(value=False),
+                ohko=tk.BooleanVar(value=False),
+            )
+            game_state[key] = v
+        return v
+
+    def modes_for(key: str) -> list:
+        if key not in RANDO_GAMES:
+            return ["Vanilla", "ROM hack only"]
+        if key == "mm6":
+            # MM6 only has the weapon-get shuffle; palette is not located.
+            return [m for m in GUI_MODES if m != "Palette shuffle only"]
+        return list(GUI_MODES)
+
+    def page_targets(c: dict, key: str, v: dict) -> list:
+        keys = [key]
+        tw = colmod.twin(key)
+        if tw and tw in colmod.games(c) and v["both"].get():
+            keys.append(tw)
+        return keys
+
+    def page_opts(key: str, v: dict):
+        gd = game_dir.get().strip()
         opts: dict = {"auto_romhacks": False}
         m = v["mode"].get()
         if m == "Randomized":
@@ -1436,18 +1645,16 @@ def cmd_gui(args: argparse.Namespace) -> int:
         elif m == "Palette shuffle only":
             opts.update(seed=random_seed(), weakness=False, weapons=False,
                         palette=True)
-        if tab["mm1"]:
+        if key == "mm1":
             opts["victory_lap"] = v["victory_lap"].get()
             opts["door_palette"] = v["door_palette"].get()
             opts["vanilla_wily"] = v["vanilla_wily"].get()
             opts["cursor_tint"] = v["cursor_tint"].get()
             opts["hard_mode"] = v["hard_mode"].get()
             opts["ohko"] = v["ohko"].get()
-        gd = game_dir.get().strip()
-        primary = tab["keys"][0]
         hs = v["hack"].get()
         if hs and hs != "<none>":
-            found = discover_romhacks(gd, primary)
+            found = discover_romhacks(gd, key)
             if hs == "<all>":
                 opts["romhacks"] = found
             else:
@@ -1455,238 +1662,289 @@ def cmd_gui(args: argparse.Namespace) -> int:
                 if picks:
                     opts["romhacks"] = picks
         elif m == "ROM hack only":
-            found = discover_romhacks(gd, primary)
+            found = discover_romhacks(gd, key)
             if found:
                 opts["romhacks"] = found
             else:
-                logq.put(f"[20xx] no patches in romhacks/{primary}/ - "
+                logq.put(f"[20xx] no patches in romhacks/{key}/ - "
                          "drop .ips/.bps there")
                 return None
         return opts
 
-    def launch_tab(tab):
-        gd = game_dir.get().strip()
-        if not gd:
-            logq.put("Set the install folder first.")
-            return
-        opts = tab_opts(tab)
-        if opts is None:
-            return
-        save_runtime()
-        targets = tab_targets(tab)
-        logq.put(f"[20xx] build {targets} mode={tab['v']['mode'].get()} "
-                 f"seed={opts.get('seed', '-')}")
-        prepare_roms(gd, os.path.join(gd, "roms"), target=targets, **opts)
-        logq.put("[20xx] launching collection...")
-        try:
-            ensure_mesen_host(gd)
-        except Exception as ex:
-            logq.put(f"[20xx] host start failed (continuing): {ex}")
-        launch(args.appid)
+    def show_game(c: dict, key: str):
+        use_collection(c)
+        clear_page()
+        g = romtable.GAMES[key]
+        crumb.set(f"Collections / {c['name']} / {g.title}")
+        page_title(g.title, f"{g.region} · mapper {g.ines_header[6] >> 4:#x} · "
+                            f"PRG {g.prg.size:#x}"
+                            + (f" · CHR {g.chr.size:#x}" if g.chr else ""))
+        ttk.Button(body, text=f"< {c['name']}",
+                   command=lambda: show_games(c)).pack(anchor="w", padx=12,
+                                                       pady=(0, 6))
+        v = vars_for(key)
+        modes = modes_for(key)
+        if v["mode"].get() not in modes:
+            v["mode"].set(modes[0])
+        mm1 = key == "mm1"
 
-    def build_tab(tab):
-        gd = game_dir.get().strip()
-        if not gd:
-            logq.put("Set the install folder first.")
-            return
-        opts = tab_opts(tab)
-        if opts is None:
-            return
-        targets = tab_targets(tab)
-        logq.put(f"[20xx] building {targets} (no launch) "
-                 f"seed={opts.get('seed', '-')}")
-        prepare_roms(gd, os.path.join(gd, "roms"), target=targets, **opts)
-        logq.put("[20xx] done - launch the collection when ready.")
-
-    def export_tab(tab):
-        gd = game_dir.get().strip()
-        if not gd:
-            logq.put("Set the install folder first.")
-            return
-        opts = tab_opts(tab)
-        if opts is None:
-            return
-        targets = tab_targets(tab)
-        dest = filedialog.askdirectory(
-            initialdir=os.path.expanduser("~"), title="Export ROMs to folder")
-        if not dest:
-            logq.put("[20xx] export cancelled")
-            return
-        dest = os.path.join(dest, "MMLC-ROMs")
-        export_roms(gd, dest, target=targets, **opts)
-        logq.put(f"[20xx] exported -> {dest}")
-
-    seed_vcmd = (root.register(lambda s: len(s) <= 16), "%P")
-
-    def refresh_tab_hacks(tab):
-        gd = game_dir.get().strip()
-        primary = tab["keys"][0]
-        found = ([os.path.basename(h) for h in discover_romhacks(gd, primary)]
-                 if gd else [])
-        tab["hack_cb"]["values"] = ["<none>"] + found + (["<all>"] if found else [])
-        tab["v"]["hack"].set("<none>")
-
-    def refresh_hacks_all(*_):
-        for tab in tabs:
-            refresh_tab_hacks(tab)
-
-    def build_game_tab(title, keys, mm1_extra):
-        fr = ttk.Frame(nb)
-        nb.add(fr, text=title)
-        v = dict(
-            target=tk.StringVar(value=keys[0]),
-            mode=tk.StringVar(value=GUI_MODES[0]),
-            seed=tk.StringVar(value=""),
-            hack=tk.StringVar(value="<none>"),
-            victory_lap=tk.BooleanVar(value=False),
-            door_palette=tk.BooleanVar(value=False),
-            vanilla_wily=tk.BooleanVar(value=False),
-            cursor_tint=tk.BooleanVar(value=False),
-            hard_mode=tk.BooleanVar(value=False),
-            ohko=tk.BooleanVar(value=False),
-        )
-        ttk.Label(fr, text="Target").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-        tvals = list(keys) + (["both"] if len(keys) > 1 else [])
-        ttk.Combobox(fr, textvariable=v["target"], values=tvals, state="readonly",
-                     width=8).grid(row=0, column=1, sticky="w", padx=6)
-        ttk.Label(fr, text="Mode").grid(row=0, column=2, sticky="w", padx=6)
-        ttk.Combobox(fr, textvariable=v["mode"], values=GUI_MODES,
-                     state="readonly", width=22).grid(row=0, column=3, sticky="w",
-                                                      padx=6)
-        ttk.Label(fr, text="Seed (blank = random)").grid(row=1, column=0, sticky="w",
-                                                         padx=6, pady=4)
+        fr = ttk.LabelFrame(body, text="Options")
+        fr.pack(fill="x", padx=12, pady=6)
+        ttk.Label(fr, text="Mode").grid(row=0, column=0, sticky="w", padx=8, pady=5)
+        ttk.Combobox(fr, textvariable=v["mode"], values=modes,
+                     state="readonly", width=22).grid(
+                         row=0, column=1, sticky="w", padx=6)
+        if key not in RANDO_GAMES:
+            ttk.Label(fr, text="Offline randomizer: US Mega Man ROMs only "
+                               "(vanilla/hacks work here).",
+                      foreground="#666").grid(row=0, column=2, columnspan=2,
+                                              sticky="w", padx=6)
+        ttk.Label(fr, text="Seed").grid(row=1, column=0, sticky="w", padx=8, pady=5)
         sf = ttk.Frame(fr)
         sf.grid(row=1, column=1, sticky="w", padx=6)
-        ttk.Entry(sf, textvariable=v["seed"], width=12, validate="key",
-                  validatecommand=seed_vcmd).pack(side="left")
+        ttk.Entry(sf, textvariable=v["seed"], width=14).pack(side="left")
         ttk.Button(sf, text="Random",
-                   command=lambda: v["seed"].set(random_seed())).pack(side="left",
-                                                                      padx=4)
-        ttk.Label(fr, text="ROM hack").grid(row=1, column=2, sticky="w", padx=6)
-        hack_cb = ttk.Combobox(fr, textvariable=v["hack"], values=["<none>"],
-                               state="readonly", width=22)
-        hack_cb.grid(row=1, column=3, sticky="w", padx=6)
-        if mm1_extra:
-            ttk.Checkbutton(fr, text="Victory lap (max boss damage)",
+                   command=lambda: v["seed"].set(random_seed())).pack(
+                       side="left", padx=4)
+        ttk.Label(fr, text="ROM hack").grid(row=2, column=0, sticky="w",
+                                            padx=8, pady=5)
+        found = ([os.path.basename(h) for h in discover_romhacks(
+            game_dir.get().strip(), key)] if game_dir.get().strip() else [])
+        hack_cb = ttk.Combobox(fr, textvariable=v["hack"],
+                               values=["<none>"] + found +
+                               (["<all>"] if found else []),
+                               state="readonly", width=30)
+        hack_cb.grid(row=2, column=1, sticky="w", padx=6)
+        if v["hack"].get() not in ["<none>", "<all>"] + found:
+            v["hack"].set("<none>")
+        tw = colmod.twin(key)
+        if tw and tw in colmod.games(c):
+            ttk.Checkbutton(fr, text=f"Also patch {romtable.GAMES[tw].title}",
+                            variable=v["both"]).grid(
+                                row=2, column=2, columnspan=2, sticky="w", padx=6)
+
+        if mm1:
+            ef = ttk.LabelFrame(body, text="MM1 extras")
+            ef.pack(fill="x", padx=12, pady=6)
+            ttk.Checkbutton(ef, text="Victory lap (max boss damage)",
                             variable=v["victory_lap"]).grid(
-                                row=2, column=0, columnspan=2, sticky="w",
-                                padx=6, pady=(4, 0))
-            ttk.Checkbutton(fr, text="Boss doors tinted by weakness",
+                                row=0, column=0, sticky="w", padx=8, pady=3)
+            ttk.Checkbutton(ef, text="Boss doors tinted by weakness",
                             variable=v["door_palette"]).grid(
-                                row=2, column=2, columnspan=2, sticky="w",
-                                padx=6, pady=(4, 0))
-            ttk.Checkbutton(fr, text="Vanilla Wily (no Wily changes)",
+                                row=0, column=1, sticky="w", padx=8, pady=3)
+            ttk.Checkbutton(ef, text="Vanilla Wily (no Wily changes)",
                             variable=v["vanilla_wily"]).grid(
-                                row=3, column=0, columnspan=2, sticky="w",
-                                padx=6, pady=(0, 4))
-            ttk.Checkbutton(fr, text="Stage-select cursor tint (weakness + green)",
+                                row=1, column=0, sticky="w", padx=8, pady=3)
+            ttk.Checkbutton(ef, text="Stage-select cursor tint (weakness + green)",
                             variable=v["cursor_tint"]).grid(
-                                row=3, column=2, columnspan=2, sticky="w",
-                                padx=6, pady=(0, 4))
-            ttk.Checkbutton(fr, text="Hard mode (damage received x2, dealt /1.5)",
+                                row=1, column=1, sticky="w", padx=8, pady=3)
+            ttk.Checkbutton(ef, text="Hard mode (damage received x2, dealt /1.5)",
                             variable=v["hard_mode"]).grid(
-                                row=4, column=0, columnspan=2, sticky="w",
-                                padx=6, pady=(0, 4))
-            ttk.Checkbutton(fr, text="OHKO (any hit = instant death)",
+                                row=2, column=0, sticky="w", padx=8, pady=3)
+            ttk.Checkbutton(ef, text="OHKO (any hit = instant death)",
                             variable=v["ohko"]).grid(
-                                row=4, column=2, columnspan=2, sticky="w",
-                                padx=6, pady=(0, 4))
-        bf = ttk.Frame(fr)
-        bf.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=6)
-        tab = {"keys": list(keys), "mm1": mm1_extra, "v": v, "hack_cb": hack_cb}
+                                row=2, column=1, sticky="w", padx=8, pady=3)
+        if key == "mm6":
+            ttk.Label(body, text="MM6 currently shuffles weapon-get rewards only; "
+                                 "its damage/weakness and palette tables are not "
+                                 "located yet.",
+                      foreground="#666").pack(anchor="w", padx=14)
+
+        def do_launch():
+            opts = page_opts(key, v)
+            if opts is None:
+                return
+            gd = game_dir.get().strip()
+            targets = page_targets(c, key, v)
+            logq.put(f"[20xx] build {targets} mode={v['mode'].get()} "
+                     f"seed={opts.get('seed', '-')}")
+            prepare_roms(gd, os.path.join(gd, "roms"), target=targets, **opts)
+            logq.put("[20xx] launching collection...")
+            try:
+                ensure_mesen_host(gd)
+            except Exception as ex:
+                logq.put(f"[20xx] host start failed (continuing): {ex}")
+            launch(c.get("appid") or args.appid)
+
+        def do_build():
+            opts = page_opts(key, v)
+            if opts is None:
+                return
+            gd = game_dir.get().strip()
+            targets = page_targets(c, key, v)
+            logq.put(f"[20xx] building {targets} (no launch) "
+                     f"seed={opts.get('seed', '-')}")
+            prepare_roms(gd, os.path.join(gd, "roms"), target=targets, **opts)
+            logq.put("[20xx] done - launch the collection when ready.")
+
+        def do_export():
+            opts = page_opts(key, v)
+            if opts is None:
+                return
+            dest = filedialog.askdirectory(
+                initialdir=os.path.expanduser("~"), title="Export ROMs to folder")
+            if not dest:
+                logq.put("[20xx] export cancelled")
+                return
+            dest = os.path.join(dest, "MMLC-ROMs")
+            targets = page_targets(c, key, v)
+            export_roms(game_dir.get().strip(), dest, target=targets, **opts)
+            logq.put(f"[20xx] exported -> {dest}")
+
+        def open_hacks():
+            d = os.path.join(romhacks_root(game_dir.get().strip()), key)
+            os.makedirs(d, exist_ok=True)
+            logq.put(f"[20xx] romhacks folder: {d}")
+            open_folder(d)
+
+        bf = ttk.Frame(body)
+        bf.pack(fill="x", padx=12, pady=10)
         ttk.Button(bf, text="Build & Launch",
-                   command=lambda: run(lambda: launch_tab(tab))).pack(side="left")
+                   command=lambda: run(do_launch)).pack(side="left")
         ttk.Button(bf, text="Build only",
-                   command=lambda: run(lambda: build_tab(tab))).pack(side="left", padx=6)
+                   command=lambda: run(do_build)).pack(side="left", padx=6)
         ttk.Button(bf, text="Export...",
-                   command=lambda: run(lambda: export_tab(tab))).pack(side="left", padx=6)
+                   command=lambda: run(do_export)).pack(side="left", padx=6)
         ttk.Button(bf, text="Open romhacks",
-                   command=lambda: run(open_romhacks)).pack(side="left", padx=6)
-        tabs.append(tab)
-        refresh_tab_hacks(tab)
+                   command=lambda: run(open_hacks)).pack(side="left", padx=6)
 
-    for _title, _keys, _mm1 in GAME_TABS:
-        build_game_tab(_title, _keys, _mm1)
+    # --- Settings page ------------------------------------------------------
+    def show_settings():
+        clear_page()
+        crumb.set("Settings")
+        page_title("Settings", "Global options plus the active collection's "
+                               "install folder.")
+        c = active_col()
+        gd = game_dir.get()
+        f1 = ttk.LabelFrame(body, text=f"Install location — {c['name']}")
+        f1.pack(fill="x", padx=12, pady=6)
+        ttk.Entry(f1, textvariable=game_dir).grid(row=0, column=0, sticky="ew",
+                                                 padx=8, pady=8)
+        f1.columnconfigure(0, weight=1)
 
-    f6 = ttk.LabelFrame(body, text="4. Controls (NES button -> Xbox button)")
-    f6.pack(fill="x", padx=10, pady=6)
-    input_vars: dict = {}
-    saved_map = cfg.get("input_map", DEFAULT_INPUT_MAP)
-    for i, key in enumerate(["btn_a", "btn_b", "btn_select", "btn_start",
-                             "btn_up", "btn_down", "btn_left", "btn_right"]):
-        r, c = divmod(i, 4)
-        ttk.Label(f6, text=INPUT_LABELS[key]).grid(row=r, column=c * 2,
-                                                   sticky="e", padx=4, pady=3)
-        v = tk.StringVar(value=saved_map.get(key, DEFAULT_INPUT_MAP[key]))
-        ttk.Combobox(f6, textvariable=v, values=INPUT_CHOICES, state="readonly",
-                     width=10).grid(row=r, column=c * 2 + 1, sticky="w", padx=4)
-        input_vars[key] = v
-    # Save/load-state and reset hotkeys (modifier + button).
-    sv_mod, sv_btn = split_state_combo(
-        cfg.get("state_save_button", DEFAULT_SAVE_STATE))
-    ld_mod, ld_btn = split_state_combo(
-        cfg.get("state_load_button", DEFAULT_LOAD_STATE))
-    rs_mod, rs_btn = split_state_combo(
-        cfg.get("state_reset_button", DEFAULT_RESET_STATE))
-    save_mod = tk.StringVar(value=sv_mod)
-    save_btn = tk.StringVar(value=sv_btn)
-    load_mod = tk.StringVar(value=ld_mod)
-    load_btn = tk.StringVar(value=ld_btn)
-    reset_mod = tk.StringVar(value=rs_mod)
-    reset_btn = tk.StringVar(value=rs_btn)
-    tb_mod, tb_btn = split_state_combo(
-        cfg.get("state_turbo_button", DEFAULT_TURBO_STATE))
-    turbo_mod = tk.StringVar(value=tb_mod)
-    turbo_btn = tk.StringVar(value=tb_btn)
-    state_slot = tk.StringVar(value=str(cfg.get("state_slot", 0)))
-    ttk.Label(f6, text="Save state").grid(row=2, column=0, sticky="e", padx=4, pady=3)
-    ttk.Combobox(f6, textvariable=save_mod, values=STATE_MODIFIERS,
-                 state="readonly", width=6).grid(row=2, column=1, sticky="w")
-    ttk.Combobox(f6, textvariable=save_btn, values=STATE_BUTTONS,
-                 state="readonly", width=9).grid(row=2, column=2, sticky="w")
-    ttk.Label(f6, text="Load state").grid(row=2, column=3, sticky="e", padx=4)
-    ttk.Combobox(f6, textvariable=load_mod, values=STATE_MODIFIERS,
-                 state="readonly", width=6).grid(row=2, column=4, sticky="w")
-    ttk.Combobox(f6, textvariable=load_btn, values=STATE_BUTTONS,
-                 state="readonly", width=9).grid(row=2, column=5, sticky="w")
-    ttk.Label(f6, text="Slot").grid(row=2, column=6, sticky="e", padx=4)
-    ttk.Entry(f6, textvariable=state_slot, width=4).grid(row=2, column=7, sticky="w")
-    ttk.Label(f6, text="Reset").grid(row=3, column=0, sticky="e", padx=4, pady=3)
-    ttk.Combobox(f6, textvariable=reset_mod, values=STATE_MODIFIERS,
-                 state="readonly", width=6).grid(row=3, column=1, sticky="w")
-    ttk.Combobox(f6, textvariable=reset_btn, values=STATE_BUTTONS,
-                 state="readonly", width=9).grid(row=3, column=2, sticky="w")
-    ttk.Label(f6, text="Turbo (hold)").grid(row=3, column=3, sticky="e", padx=4)
-    ttk.Combobox(f6, textvariable=turbo_mod, values=STATE_MODIFIERS,
-                 state="readonly", width=6).grid(row=3, column=4, sticky="w")
-    ttk.Combobox(f6, textvariable=turbo_btn, values=STATE_BUTTONS,
-                 state="readonly", width=9).grid(row=3, column=5, sticky="w")
-    ttk.Button(f6, text="Save controls", command=lambda: run(save_controls)
-               ).grid(row=4, column=0, columnspan=2, pady=4, sticky="w")
+        def browse_dir():
+            d = filedialog.askdirectory(initialdir=game_dir.get() or
+                                        os.path.expanduser("~"))
+            if d:
+                game_dir.set(d)
+                c["game_dir"] = d
+                save_config()
 
-    f5 = ttk.Frame(body)
-    f5.pack(fill="x", padx=10, pady=4)
-    ttk.Button(f5, text="Rescan hacks",
-               command=lambda: (refresh_hacks_all(),
-                                logq.put("[20xx] romhack list refreshed"))
-               ).pack(side="left", padx=6)
+        def auto_dir():
+            game_dir.set(game_dir_default())
+            c["game_dir"] = game_dir.get()
+            save_config()
 
-    log = ScrolledText(body, height=15, state="disabled", font=("monospace", 9))
-    log.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+        ttk.Button(f1, text="Browse", command=browse_dir).grid(row=0, column=1, padx=4)
+        ttk.Button(f1, text="Auto-detect", command=auto_dir).grid(row=0, column=2, padx=4)
+        ttk.Label(f1, text="Steamless.CLI.exe").grid(row=1, column=0, sticky="w",
+                                                     padx=8, pady=(0, 4))
+        ttk.Entry(f1, textvariable=steamless_cli).grid(row=2, column=0, sticky="ew",
+                                                       padx=8, pady=(0, 8))
 
-    def append(msg):
-        log.configure(state="normal")
-        log.insert("end", str(msg) + "\n")
-        log.see("end")
-        log.configure(state="disabled")
+        def browse_steamless():
+            f = filedialog.askopenfilename(
+                initialdir=os.path.expanduser("~"),
+                title="Select Steamless.CLI.exe",
+                filetypes=[("Steamless CLI", "*.exe"), ("All files", "*")])
+            if f:
+                steamless_cli.set(f)
 
-    def pump():
-        try:
-            while True:
-                append(logq.get_nowait())
-        except queue.Empty:
-            pass
-        root.after(100, pump)
+        ttk.Button(f1, text="Browse", command=browse_steamless).grid(
+            row=2, column=1, padx=4, pady=(0, 8))
+        ttk.Button(f1, text="Auto-detect",
+                   command=lambda: steamless_cli.set(_detect_steamless() or "")
+                   ).grid(row=2, column=2, padx=4, pady=(0, 8))
+
+        f2 = ttk.LabelFrame(body, text="Mesen core (user-supplied; GPLv3, not bundled)")
+        f2.pack(fill="x", padx=12, pady=6)
+        ttk.Entry(f2, textvariable=core).grid(row=0, column=0, sticky="ew",
+                                              padx=8, pady=8)
+        f2.columnconfigure(0, weight=1)
+
+        def browse_core():
+            f = filedialog.askopenfilename(initialdir=os.path.expanduser("~"),
+                                           title="Select MesenCore.so / MesenCore.dll")
+            if f:
+                core.set(f)
+
+        ttk.Button(f2, text="Browse", command=browse_core).grid(row=0, column=1, padx=4)
+        ttk.Button(f2, text="Auto-detect",
+                   command=lambda: core.set(find_core(game_dir.get()) or "")
+                   ).grid(row=0, column=2, padx=4)
+        ttk.Button(f2, text="Build core",
+                   command=lambda: run(build_core_task)).grid(row=0, column=3, padx=4)
+
+        f3 = ttk.Frame(body)
+        f3.pack(fill="x", padx=12, pady=2)
+        ttk.Button(f3, text="Setup / Repair",
+                   command=lambda: run(setup_task)).pack(side="left")
+        ttk.Button(f3, text="Verify install",
+                   command=lambda: run(verify_task)).pack(side="left", padx=6)
+
+        fg = ttk.LabelFrame(body, text="Overclock (global)")
+        fg.pack(fill="x", padx=12, pady=6)
+        ttk.Checkbutton(fg, text="Follow in-game CPU SPEED",
+                        variable=oc_follow).grid(row=0, column=0, sticky="w",
+                                                 padx=8, pady=4)
+        ttk.Label(fg, text="Turbo scanlines").grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Entry(fg, textvariable=oc_turbo, width=8).grid(
+            row=0, column=2, sticky="w", padx=6)
+
+        f6 = ttk.LabelFrame(body, text="Controls (NES button -> Xbox button)")
+        f6.pack(fill="x", padx=12, pady=6)
+        for i, key in enumerate(INPUT_LABELS):
+            r, col = divmod(i, 4)
+            ttk.Label(f6, text=INPUT_LABELS[key]).grid(row=r, column=col * 2,
+                                                       sticky="e", padx=4, pady=3)
+            ttk.Combobox(f6, textvariable=input_vars[key], values=INPUT_CHOICES,
+                         state="readonly", width=10).grid(
+                             row=r, column=col * 2 + 1, sticky="w", padx=4)
+        ttk.Label(f6, text="Save state").grid(row=2, column=0, sticky="e",
+                                              padx=4, pady=3)
+        ttk.Combobox(f6, textvariable=save_mod, values=STATE_MODIFIERS,
+                     state="readonly", width=6).grid(row=2, column=1, sticky="w")
+        ttk.Combobox(f6, textvariable=save_btn, values=STATE_BUTTONS,
+                     state="readonly", width=9).grid(row=2, column=2, sticky="w")
+        ttk.Label(f6, text="Load state").grid(row=2, column=3, sticky="e", padx=4)
+        ttk.Combobox(f6, textvariable=load_mod, values=STATE_MODIFIERS,
+                     state="readonly", width=6).grid(row=2, column=4, sticky="w")
+        ttk.Combobox(f6, textvariable=load_btn, values=STATE_BUTTONS,
+                     state="readonly", width=9).grid(row=2, column=5, sticky="w")
+        ttk.Label(f6, text="Slot").grid(row=2, column=6, sticky="e", padx=4)
+        ttk.Entry(f6, textvariable=state_slot, width=4).grid(row=2, column=7,
+                                                             sticky="w")
+        ttk.Label(f6, text="Reset").grid(row=3, column=0, sticky="e", padx=4,
+                                         pady=3)
+        ttk.Combobox(f6, textvariable=reset_mod, values=STATE_MODIFIERS,
+                     state="readonly", width=6).grid(row=3, column=1, sticky="w")
+        ttk.Combobox(f6, textvariable=reset_btn, values=STATE_BUTTONS,
+                     state="readonly", width=9).grid(row=3, column=2, sticky="w")
+        ttk.Label(f6, text="Turbo (hold)").grid(row=3, column=3, sticky="e",
+                                                padx=4)
+        ttk.Combobox(f6, textvariable=turbo_mod, values=STATE_MODIFIERS,
+                     state="readonly", width=6).grid(row=3, column=4, sticky="w")
+        ttk.Combobox(f6, textvariable=turbo_btn, values=STATE_BUTTONS,
+                     state="readonly", width=9).grid(row=3, column=5, sticky="w")
+        ttk.Button(f6, text="Save controls",
+                   command=lambda: run(save_controls)).grid(
+                       row=4, column=0, columnspan=2, pady=4, sticky="w")
+        bf = ttk.Frame(body)
+        bf.pack(fill="x", padx=12, pady=8)
+        ttk.Button(bf, text="< Back",
+                   command=show_collections).pack(side="left")
+
+    # --- Tasks shared by pages ---------------------------------------------
+    def save_runtime():
+        gd = game_dir.get().strip()
+        if not gd:
+            return
+        write_input_map(gd, {k: v.get() for k, v in input_vars.items()})
+        ini_set(gd, {"state_save_button": join_state_combo(save_mod.get(), save_btn.get()),
+                     "state_load_button": join_state_combo(load_mod.get(), load_btn.get()),
+                     "state_reset_button": join_state_combo(reset_mod.get(), reset_btn.get()),
+                     "state_turbo_button": join_state_combo(turbo_mod.get(), turbo_btn.get()),
+                     "state_slot": state_slot.get().strip() or "0"})
 
     def build_core_task():
         c = build_core(None, status=lambda m: logq.put(m))
@@ -1720,7 +1978,9 @@ def cmd_gui(args: argparse.Namespace) -> int:
                   "steamless": steamless_cli.get().strip(), "input_map": m,
                   "state_save_button": sv, "state_load_button": ld,
                   "state_reset_button": rs, "state_turbo_button": tb,
-                  "state_slot": slot})
+                  "state_slot": slot,
+                  "collections": state["collections"],
+                  "collection_id": active.get()})
         gui_config_save(c)
         logq.put("[20xx] controls saved: "
                  + ", ".join(f"{k[4:]}={v}" for k, v in m.items()))
@@ -1732,6 +1992,7 @@ def cmd_gui(args: argparse.Namespace) -> int:
         if not gd:
             logq.put("Set the install folder first.")
             return
+        save_runtime()
         logq.put(f"[20xx] install: {gd}")
         ensure_proteus_unpacked(gd, steamless_cli.get().strip() or None,
                                 status=lambda m: logq.put(m))
@@ -1769,22 +2030,15 @@ def cmd_gui(args: argparse.Namespace) -> int:
             logq.put(f"[20xx] mesen_host: {host}")
         written = extract(gd, os.path.join(gd, "roms"), None, None, quiet=True)
         logq.put(f"[20xx] extracted {len(written)} ROM(s) -> {os.path.join(gd, 'roms')}")
-        c2 = dict(gui_config_load())
-        c2.update({"game_dir": gd, "core": c,
-                   "steamless": steamless_cli.get().strip(),
-                   "oc_follow": bool(oc_follow.get()), "oc_turbo": turbo,
-                   "state_save_button": sv, "state_load_button": ld,
-                   "state_reset_button": rs, "state_turbo_button": tb,
-                   "state_slot": state_slot.get().strip() or "0",
-                   "input_map": {k: v.get() for k, v in input_vars.items()}})
-        gui_config_save(c2)
+        save_config()
         logq.put("[20xx] setup complete.")
 
     def verify_task():
         gd = game_dir.get().strip()
         pe = PE(find_source(gd))
         bad = 0
-        for k in GAME_ORDER:
+        keys = colmod.games(active_col()) or GAME_ORDER
+        for k in keys:
             g = romtable.GAMES[k]
             crc = patcher.crc32(patcher.read_prg(pe, g))
             want = romtable.ORIGINAL_PRG_CRC.get(k)
@@ -1792,10 +2046,9 @@ def cmd_gui(args: argparse.Namespace) -> int:
             bad += 0 if ok else 1
             logq.put(f"  {k:4} {g.title:14} crc={crc:#010x} "
                      f"{'ok' if ok else 'MISMATCH'}")
-        logq.put(f"[20xx] verify: {len(GAME_ORDER) - bad}/{len(GAME_ORDER)} ok")
+        logq.put(f"[20xx] verify: {len(keys) - bad}/{len(keys)} ok")
 
     def _wheel(e):
-        # Widgets that scroll/select themselves keep the event.
         try:
             cls = e.widget.winfo_class()
         except Exception:
@@ -1810,7 +2063,20 @@ def cmd_gui(args: argparse.Namespace) -> int:
     for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
         root.bind_all(_seq, _wheel, add="+")
 
-    refresh_hacks_all()
+    def _select_all(e):
+        w = e.widget
+        try:
+            if w.winfo_class() in ("Entry", "TEntry", "TCombobox"):
+                w.selection_range(0, "end")
+            elif w.winfo_class() == "Text":
+                w.tag_add("sel", "1.0", "end-1c")
+        except Exception:
+            pass
+        return "break"
+
+    root.bind_all("<Control-a>", _select_all, add="+")
+
+    show_collections()
     pump()
     root.mainloop()
     return 0

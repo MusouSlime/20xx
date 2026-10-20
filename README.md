@@ -40,12 +40,15 @@ bytes verbatim, which is exactly what a randomizer expects.
   where selected) to `~/MMLC-ROMs` with friendly names, for use in any emulator.
 - **Save-state hotkeys** (Mesen mode): **LB+Y** saves, **LB+B** loads,
   **LB+Start** soft-resets the console, **LB+X** turbos (hold to fast-forward)
-  (slot 0). Set them in the GUI's **4. Controls** section
+  (slot 0). Set them in the GUI's **Settings → Controls** section
   (modifier + button + slot) or via `20xx states --save-button ...
   --load-button ... --reset-button ... --turbo-button ... --slot N`.
   Overclock follows MMLC's in-game **CPU SPEED** option; tune with `20xx overclock`.
 - **Launcher:** a terminal UI (`20xx`), a Tk GUI (`20xx gui`), and a Steam
-  pre-launch hook (`20xx prelaunch %command%`).
+  pre-launch hook (`20xx prelaunch %command%`). The GUI is collection-aware:
+  pick a collection, pick a game, then work on that game's page. Additional
+  collection folders can be registered with **+ Add collection** (MMLC1 is the
+  only kind with a game table today; other types are kept as placeholders).
 - **Patch-only and reversible:** it operates on your install; the game files are
   backed up before any on-disk change.
 
@@ -113,7 +116,7 @@ host is Linux-only.
 # re-unpack after a Steam update/repair replaces Proteus.exe
 20xx unpack --steamless /path/to/Steamless.CLI.exe
 
-# launch the GUI wizard (install folder, setup/repair, options, launch)
+# launch the GUI: Collections -> game -> game page (Settings for setup)
 20xx gui
 # or double-click the launcher:  ./20xx-gui.sh  (Linux)  20xx-gui.bat  (Windows)
 
