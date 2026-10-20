@@ -155,6 +155,59 @@ F=`0x40`, E=`0x04`, G=`0x08`. Super Arm's weakness (index 6, dmg 14) must be
 placed on a boss with throwable blocks (bosses 0/4/5). Implemented in
 `tools/mmlc/randomizer.py`; synced into `database.xml` `weakness_sprite`.
 
+### MM1 boss doors ("after doors" palettes)
+
+Each robot-master stage swaps the whole BG palette to a per-stage 16-byte
+row when Mega Man scrolls into the first-door screen, *before* the shutter
+opens (`ScrollNextRoom` in the disassembly: copies
+`AfterDoorsPalette[stage*16]` (CPU `$9F0D`) to `BGPalettes` RAM, then
+`OpenFirstDoor`). The boss shutter tiles use BG palette slots **{0, 2}**
+(decoded from the shared `RoomShutterBlockPals` attribute bytes for the
+shutter entries used by all six robot stages).
+
+| stage (order = damage-table order) | PRG row | vanilla bytes |
+|---|---|---|
+| Cut Man | `0x15F0D` | `0F 30 2B 06 0F 30 2B 2C 0F 20 10 00 0F 20 10 2C` |
+| Ice Man | `0x15F1D` | `0F 20 21 11 0F 20 3C 2C 0F 20 21 2C 0F 20 09 1C` |
+| Bomb Man | `0x15F2D` | `0F 20 10 11 0F 20 10 21 0F 29 19 07 0F 27 06 21` |
+| Fire Man | `0x15F3D` | `0F 30 10 06 0F 1B 0B 00 0F 27 16 06 0F 26 16 06` |
+| Elec Man | `0x15F4D` | `0F 20 27 17 0F 20 27 21 0F 0F 0F 0C 0F 28 29 18` |
+| Guts Man | `0x15F5D` | `0F 26 17 07 0F 30 10 02 0F 26 17 02 0F 37 27 17` |
+
+Stage order = Cut, Ice, Bomb, Fire, Elec, Guts was verified three ways:
+`FightingBossNum = CurrentStage` (PRG `0x1503A`, so damage rows are stage
+rows); the vanilla weapon-reward table reads `20 10 02 40 04 08`
+(C,I,B,F,E,G — each stage awards its own boss's weapon); the stage-select
+portrait loop pairs the same order with `WeaponsOwnedBits`.
+`tools/mmlc/wily_patches.py` (`--colored-doors`) tints slots 0+2 (bytes
+1-3, `$0F` backdrop preserved) of each row with the damage-table-argmax
+weakness robot master's colors.
+
+### MM1 Wily damage rows (Vanilla Wily)
+
+The damage table continues past the 6 robot rows: rows 6-10 (PRG
+`0x1FE1E + 8*i`, 40 bytes) are the Wily stages' rows:
+
+| stage | bytes |
+|---|---|
+| Wily 1 (Yellow Devil) | `02 02 00 00 02 04 00 00` |
+| Wily 2 (Copy Robot + Cut/Elec refights) | `01 01 00 02 02 02 00 00` |
+| Wily 3 (CWU-01P uses the enemy damage path) | `00 00 00 00 00 00 00 00` |
+| Wily 4 (Wily Machine + refights) | `01 01 01 01 04 01 01 00` |
+| weapon-get screen (transient `$AC=10`) | `01 01 00 01 01 01 01 00` |
+
+Wily refights use their Wily stage's rows (7/9), never robot rows 0-5:
+no code remaps `FightingBossNum` for refights (the only `$AC` stores are
+stage init `STA $AC,CurrentStage` at PRG `0x1503A`, the defeat fanfare,
+and Wily-7/transition code). The door (AfterDoors rows 0-5) patch therefore
+cannot touch Wily content. **Victory Lap now targets only the Wily rows
+(6-10)** — the robot-master rows (0-5) are left as the randomizer/vanilla set
+them, so robot fights and their weakness colors are unaffected. The randomizer
+also shuffles the Wily rows (6,7,9,10) among themselves — the all-zero CWU-01P
+row (8) stays fixed so no Wily boss can become immune. `tools/mmlc/wily.py`
+(`--vanilla-wily`) restores rows 6-10 byte-exact (undoing both; repairs dirty
+sources; no-op on clean ROMs).
+
 ### In-engine randomizer + weakness visualizer
 
 The proxy can randomize MM1 at load (`randomize=1` in `mmlc.ini`): it shuffles
@@ -164,12 +217,97 @@ fresh seed and logs it). The C algorithm (`src/proxy/mm1_rando.h`) and the
 Python one (`tools/mmlc/randomizer.py`) share an xorshift32/FNV-1a RNG and are
 byte-for-byte identical (verified by `test/mm1_rando_test.c`).
 
+Two post-shuffle rules (both mirrored in C, applied after the row shuffle +
+Super-Arm/throwable fix, before rewards/palette so the RNG stays in sync):
+
+- **Buster standard** (`_flatten_buster`): the boss weak to Guts Man's weapon
+  (Super Arm, index 6) keeps Cut Man's elevated Buster (`3`); every other boss
+  drops to `1`. Because the stage-select green marker follows the highest
+  column-0 damage, it now always points at the Guts-weak "beginner" boss.
+- **Wily shuffle** (`_shuffle_wily`): the Wily rows (6,7,9,10) are permuted
+  among themselves; the all-zero CWU-01P row (8) stays fixed.
+
 The **weakness visualizer** (`WEAKNESSVISUALIZER.ips`, avvie/MegamanRandomizer,
 GPLv3) is embedded in the proxy. It adds stage-select code and reads a 6-byte
 weakness table at PRG `0x1BFCC` (value per boss from
 `{1:0x20,2:0x10,3:0x02,4:0x40,5:0x04,6:0x08}`). IPS offsets include the 16-byte
 iNES header, so apply with `adjust = -0x10`. With the visualizer on, `0x1BFCC`
 holds weaknesses (not rewards) and the Guts Man fix byte is left to the patch.
+Note `0x1BFCC` is also the game's boss-defeated table, so only valid weapon
+values (or `0x00` = default rendering) may be written there.
+
+The visualizer's injected routine (53 bytes at PRG `0x1FF00`, `Y` = boss
+index) writes one portrait palette byte per boss via `STA $2007` at
+`0x1FF2B`. Our green top-buster marker trampolines that store through free
+zero space: `JMP $FF35` at `0x1FF2B`; `CPY $FF43 : BNE +2 : LDA #$2A :
+STA $2007 : JMP $FF2E` at `0x1FF35-0x1FF41`; winning boss index at `0x1FF43`.
+The boss with the highest Buster (column-0) damage therefore renders NES
+light green (`$2A`) on the stage select. Implemented in both
+`tools/mmlc/randomizer.py` (`apply_green_top_buster`) and
+`src/proxy/mm1_rando.h` (`mm1_apply_green`); C/Python parity re-verified
+byte-for-byte with `test/mm1_rando_test.c`.
+
+### Cursor-driven stage-select tint hook (replaces the inert marker visibly)
+
+`CurrentStage` (`$31`) is both the stage-select cursor and the stage index:
+the select loop (`L1B721`, bank6) moves it with Left/Right through the
+`L1BEB0` table (`Right: 0->5->1->2->3->4->0`, Left reverses; Up/Down/Start-bit
+patterns ignored; Start alone enters the stage) and stage init does
+`STA $AC,CurrentStage`. Values 0-5 are Cut/Ice/Bomb/Fire/Elec/Guts
+(damage-table order), so no cursor->boss translation is needed. Screen
+layout: r1 Cut/Guts, r2 Elec/Ice, r3 Fire/Bomb.
+
+The cursor highlight is painted by `F1BB02`, called with A=`$55` (on) or
+`$00` (off): once at init, `F1BB02($00)` for the old stage on every move,
+and `F1BB02($55/$00)` from a blink path every 16 frames. It queues 6 BG
+attr transfers + sets 4 cursor-sprite attrs (`$032D/$0331` = entry A,
+`$0335/$0339` = A&`$0F`) and ends with `STA $1C; RTS` (bytes `85 1C 60`
+at PRG `0x1BB47`). GOTCHA: A at the tail is always `$86`/`$8A` (the
+all-defeated branch clobbered the entry A), so a tail hook must gate on
+`$032D` (which still holds the entry A), never on A itself.
+
+The hook replaces the tail with `JSR $FF44` (exact 3-byte fit) and, on
+highlight-on calls only (tint stays solid while the border blinks),
+rewrites all five sprite faces' OAM palette bits (faces at OAM entries
+`[2,13,23,33,45]`+9, attr addrs `$020A/$0236/$025E/$0286/$02B6`, vanilla
+slots `[2,0,3,2,3]`, stable across boots) so the selected face uses sprite
+slot 1 while the rest keep vanilla slots; recolors sprite slot 1
+(`$03E5-7`, RAM `SpritePalettes` page) with the selected boss's weakness
+triple (`[light,dark,light]`, doors convention, from the weakness robot
+master's `ROBOT_MASTER_COLORS`; solid `$2A` when the selected boss is the
+`$FF43` top-buster boss); mirrors the triple to BG slot 3 (`$03DD-DF`)
+when Guts (BG-only face) is selected; then triggers the NMI flush
+(`$3A/$3B`=`$03D0` image, `$34`=`$20`, `$37`=`1`). The 32-byte base image
+is read post-patches from `L1BDAB` (`0x1BDAB`) because the `$03D0/$03E0`
+RAM buffers hold stale (non-stage-select) data. Slot 1 is otherwise used
+by 4 tiny deco/cursor sprites (accepted collateral). Layout: 144-byte code
+at `0x1FF44` (`$FF44`, 156B cave) + 54-byte data at `0x1FCC7` (`$FCC7`,
+59B cave: 32B base + 12B weakness pairs + 5B OAM bases + 5B vanilla
+slots). Installed with `--visualizer` (reads `$FF43`, carries the
+visualizer's BG tint) or standalone via `--cursor-tint` (no visualizer
+routine: `$FF43` recorded directly, vanilla `L1BDAB` base -- this combo also
+dodges the visualizer's Guts-blank side effect); `refresh_cursor_hook`
+recomputes data + `$FF43` after victory lap rewrites the charts. NMI-safety: the hook borrows
+`$0C/$0D/$0E` (F1BB02's own scratch, dead at the tail); NMI's
+`DoTSAPPUtransfer` also uses them, but hook calls run at frame start
+(right after `NextFrame`) while NMI fires at frame end, so they cannot
+overlap -- same exposure as vanilla `F1BB02` itself. Implemented in both
+`tools/mmlc/randomizer.py` (`apply_cursor_hook`) and `src/proxy/mm1_rando.h`
+(`mm1_apply_cursor_hook`); verified input-driven in Mesen2 (every cursor
+value: exact OAM slots + palette bytes, green face on top-buster,
+border-only blink diffs = no vblank glitches, stage entry identical).
+Exposed as the fourth independent MM1 checkbutton in the 20xx GUI
+(`Stage-select cursor tint`, default on to preserve the shipped
+Randomized look -- uncheck for visualizer without tint) and as
+`20xx --cursor-tint`, threaded through `build_patched_nes`/`patch_game`/
+`prepare_roms`/`export_roms` like the Wily options (works seedless on
+vanilla charts too).
+
+Known pre-existing visualizer issues (present with or without the hook,
+documented not fixed here): avvie's IPS *code* hunk blanks the Guts
+portrait on the MMLC ROM (weakness *data* at `$1BFCC` alone is harmless --
+all faces render); and the stage intro briefly shows a `CLEAR POINTS`
+tally screen (vanilla MMLC flow, identical on clean ROMs).
 
 ### Packed backup keeps `.rdata`
 
@@ -312,11 +450,13 @@ tables inside `data.pie`; there is no separate menu binary format.
 
 - The core exports `SaveState`/`LoadState`/`ResetConsole` and the host handles
   `MESEN_CMD_SAVE_STATE`/`LOAD_STATE`/`RESET`; the proxy binds them to controller
-  combos: **LB+Y = save**, **LB+B = load**, **LB+X = reset** (slot 0).
+  combos: **LB+Y = save**, **LB+B = load**, **LB+Start = reset**,
+  **LB+X = turbo** (hold to fast-forward; `MESEN_CMD_SET_SPEED`), slot 0.
   Configurable via `state_save_button` / `state_load_button` /
-  `state_reset_button` (e.g. `lb+y`, `"0"` disables) and `state_slot`. Exposed via
+  `state_reset_button` / `state_turbo_button` (e.g. `lb+y`, `"0"` disables),
+  `state_turbo_speed` (percent, default 200) and `state_slot`. Exposed via
   `20xx states`. LB/Y/B/X are unused by the default NES mapping, so the combos
-  don't disturb play.
+  don't disturb play (LB+Start also sends NES Start, but the reset wins).
 
 ## Steam API
 

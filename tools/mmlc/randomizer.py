@@ -161,6 +161,25 @@ def _argmax(chart: List[int]) -> int:
     return chart.index(max(chart))
 
 
+def describe_mm1(prg: bytes) -> Spoiler:
+    """Describe the weakness mapping currently in an MM1 PRG (read-only).
+
+    Returns a Spoiler whose ``weaknesses`` map each database boss entry to
+    the weapon sprite with the highest damage in that boss's chart -- the
+    same convention ``randomize_mm1`` uses. Never mutates ``prg``. Used by
+    the "Randomizer Check" flow to report what an installed ROM contains.
+    """
+    if len(prg) != MM1_PRG_SIZE:
+        raise RandomizerError(
+            f"MM1 PRG must be {MM1_PRG_SIZE:#x} bytes, got {len(prg):#x}"
+        )
+    charts = _read_charts(prg)
+    spoiler = Spoiler("mm1", "current")
+    for i, chart in enumerate(charts):
+        spoiler.weaknesses[MM1_BOSS_ENTRIES[i]] = WEAPON_SPRITE[_argmax(chart)]
+    return spoiler
+
+
 def _apply_ips(buf: bytearray, ips: bytes, adjust: int) -> None:
     if ips[:5] != b"PATCH":
         raise RandomizerError("not an IPS file")
@@ -188,6 +207,279 @@ def apply_visualizer(prg: bytearray) -> None:
         _apply_ips(prg, fh.read(), -0x10)
 
 
+# Green top-buster marker: the visualizer's injected stage-select routine
+# (53 bytes at PRG 0x1FF00, Y = boss index 0-5) writes one portrait palette
+# byte per boss via STA $2007 at 0x1FF2B. We trampoline that store through
+# free zero space so the boss taking the most Buster damage renders green.
+MM1_VIS_ROUTINE_STA = 0x1FF2B    # STA $2007 site inside the injected routine
+MM1_VIS_STA_BYTES = b"\x8D\x07\x20"
+MM1_GREEN_CODE = 0x1FF35          # 13 bytes of free zero space
+MM1_GREEN_BOSS = 0x1FF43          # stored top-buster boss index (0-5)
+MM1_GREEN_COLOR = 0x2A            # NES light green
+
+
+def apply_green_top_buster(prg: bytearray, charts: List[List[int]]) -> int:
+    """Mark the highest-buster-damage boss green on the stage select.
+
+    ``charts`` are the (possibly shuffled) damage charts; the boss with the
+    highest column-0 (Buster) value wins (first wins ties). Requires the
+    visualizer IPS to be applied first; raises :class:`RandomizerError`
+    otherwise. Returns the winning boss index. Mirrored in C
+    (``mm1_apply_green`` in src/proxy/mm1_rando.h) for byte parity.
+    """
+    top = max(range(6), key=lambda b: charts[b][0])
+    if prg[MM1_VIS_ROUTINE_STA:MM1_VIS_ROUTINE_STA + 3] != MM1_VIS_STA_BYTES:
+        raise RandomizerError(
+            "visualizer routine missing at 0x1FF2B; green marker needs it")
+    prg[MM1_VIS_ROUTINE_STA:MM1_VIS_ROUTINE_STA + 3] = bytes([0x4C, 0x35, 0xFF])
+    prg[MM1_GREEN_CODE:MM1_GREEN_CODE + 13] = bytes([
+        0xCC, 0x43, 0xFF,   # CPY GreenBoss
+        0xD0, 0x02,         # BNE +2 -> STA (passthrough for other bosses)
+        0xA9, MM1_GREEN_COLOR,  # LDA #green
+        0x8D, 0x07, 0x20,   # STA $2007 (both paths converge here)
+        0x4C, 0x2E, 0xFF,   # JMP back to INY
+    ])
+    prg[MM1_GREEN_CODE + 13] = 0x00
+    prg[MM1_GREEN_BOSS] = top
+    return top
+
+
+# Cursor-driven stage-select tint hook.
+#
+# Disassembly ground truth (mm1dasm bank6, verified against the MMLC ROM):
+# - ``CurrentStage`` ($31) is BOTH the stage-select cursor and the stage
+#   index: the select loop (L1B721) moves it with Left/Right through the
+#   L1BEB0 table and stage init does ``STA $AC,CurrentStage``. Values 0-5
+#   are Cut/Ice/Bomb/Fire/Elec/Guts (damage-table order), so no
+#   cursor->boss translation is needed.
+# - The cursor highlight is painted by F1BB02, called with A=$55 (highlight
+#   on) or A=$00 (off): every cursor move calls F1BB02($00) for the old
+#   stage, and a blink path calls F1BB02($55/$00) every 16 frames. The
+#   routine ends with ``STA $1C; RTS`` (bytes 85 1C 60 at file 0x1BB47).
+# - NMI flushes palettes iff $37 (PaletteUpdateDelay) != 0 via
+#   UpdatePalettes ($D60A): with $37=1 it writes 32 bytes BG+SPR from the
+#   RAM image at ($3A/$3B) using $34 as the WritePalette param ($20).
+#   Sprite palettes live in RAM at $03E0 (SpritePalettes), BG at $03D0
+#   (BGPalettes) -- but both hold stale (non-stage-select) data here, so
+#   the hook carries its own 32-byte base image (read post-patches from
+#   L1BDAB at 0x1BDAB) and flushes the full image every time.
+#
+# What the hook does on each F1BB02($55) call: read $31, rewrite all five
+# sprite faces' OAM palette bits (OAM entries [2,13,23,33,45]+9, stable
+# across boots) so the selected face uses sprite slot 1 while the others
+# keep their vanilla slots, recolor sprite slot 1 ($03E5-7) with the
+# selected boss's weakness colors (or solid $2A green when it is the
+# top-buster boss per $FF43), recolor BG slot 3 ($03DD-DF) the same way
+# when Guts (BG-only face) is selected, then trigger the $37 flush.
+# Sprite slot 1 is otherwise used by 4 tiny deco/cursor sprites (accepted
+# collateral). On F1BB02($00) calls (blink-off, unhighlight-old) the hook
+# does nothing, so the tint stays solid while the border blinks.
+MM1_CURSOR_VAR = 0x31            # CurrentStage (cursor + stage index)
+MM1_HOOK_JSR_SITE = 0x1BB47     # F1BB02 tail: STA $1C; RTS
+MM1_HOOK_JSR_BYTES = b"\x85\x1C\x60"
+MM1_HOOK_CODE = 0x1FF44         # 156 zero bytes 0x1FF44-0x1FFDF (CPU $FF44)
+MM1_HOOK_CODE_CPU = 0xFF44
+MM1_HOOK_CODE_LEN = 156
+MM1_HOOK_DATA = 0x1FCC7         # 59 zero bytes (CPU $FCC7)
+MM1_HOOK_DATA_CPU = 0xFCC7
+MM1_HOOK_DATA_LEN = 59
+MM1_STAGESEL_PAL = 0x1BDAB      # L1BDAB: 32-byte stage-select palette
+MM1_HOOK_GREEN = 0x2A           # solid green face for the top-buster boss
+# OAM attr low-byte per face (all in the $02xx OAM buffer page), vanilla
+# sprite-palette slot per face. Faces: Cut/Ice/Bomb/Fire/Elec at OAM
+# entries [2,13,23,33,45] (attr = entry*4+2).
+MM1_HOOK_FACE_BASES = [0x0A, 0x36, 0x5E, 0x86, 0xB6]
+MM1_HOOK_FACE_SLOTS = [2, 0, 3, 2, 3]
+
+
+def _cursor_hook_code() -> bytes:
+    """Assemble the cursor-hook 6502 routine (absolute data-cave addresses
+    baked in). Returns the code bytes (must fit MM1_HOOK_CODE_LEN)."""
+    BASE = MM1_HOOK_DATA_CPU
+    WCOL = BASE + 32
+    OFS = BASE + 44
+    VSL = BASE + 49
+    out = bytearray()
+    at: dict = {}
+    fix: list = []  # (offset_pos, label, kind='rel'|'abs')
+
+    def L(name: str) -> None:
+        at[name] = len(out)
+
+    def BR(op: int, label: str) -> None:
+        fix.append((len(out) + 1, label, "rel"))
+        out.extend((op, 0))
+
+    out.extend((0x85, 0x1C))      # sta $1C (preserve F1BB02 tail behavior)
+    # NOTE: A at the tail is $86/$8A (the all-defeated branch clobbered the
+    # entry $55/$00), so the on/off gate reads $032D, which F1BB02 set to
+    # the entry A (cursor-sprite attr) earlier in the same call.
+    out.extend((0xAD, 0x2D, 0x03))  # lda $032D (highlight-on?)
+    out.extend((0xC9, 0x55))      # cmp #$55
+    out.extend((0xF0, 0x03))      # beq CONT (fixed +3 over the jmp)
+    out.extend((0x4C, 0, 0))      # jmp DONE (patched below; too far for bne)
+    fix.append((len(out) - 2, "DONE", "abs"))
+    L("CONT")
+    out.extend((0xA6, MM1_CURSOR_VAR))  # ldx CurrentStage (boss 0-5)
+    out.extend((0xE0, 0x06))      # cpx #$06 (post-game guard)
+    out.extend((0x90, 0x03))      # bcc CONT2 (fixed +3 over the jmp)
+    out.extend((0x4C, 0, 0))      # jmp DONE (patched below; too far for bcs)
+    fix.append((len(out) - 2, "DONE", "abs"))
+    L("CONT2")
+    out.extend((0xA9, 0x02))      # lda #$02 (OAM buffer page)
+    out.extend((0x85, 0x0D))      # sta $0D
+    out.extend((0xA2, 0x04))      # ldx #$04 (face 4..0)
+    L("OFACE")
+    out.extend((0xBD, OFS & 0xFF, OFS >> 8))  # lda OFS,x
+    out.extend((0x85, 0x0C))      # sta $0C (attr addr lo)
+    out.extend((0xBD, VSL & 0xFF, VSL >> 8))  # lda VSL,x (vanilla slot)
+    out.extend((0xE4, MM1_CURSOR_VAR))  # cpx CurrentStage (selected?)
+    BR(0xD0, "KEEP")              # bne KEEP
+    out.extend((0xA9, 0x01))      # lda #$01 (steal sprite slot 1)
+    L("KEEP")
+    out.extend((0x85, 0x0E))      # sta $0E (slot)
+    out.extend((0xA0, 0x24))      # ldy #$24 (sprite 8 offset)
+    L("INNER")
+    out.extend((0x88, 0x88, 0x88, 0x88))  # dey x4 (sprite offset -= 4)
+    out.extend((0xB1, 0x0C))      # lda ($0C),y
+    out.extend((0x29, 0xFC))      # and #$FC (keep flip/priority bits)
+    out.extend((0x05, 0x0E))      # ora $0E
+    out.extend((0x91, 0x0C))      # sta ($0C),y
+    out.extend((0x98,))           # tya (refresh Z from Y; ora clobbered it)
+    BR(0xD0, "INNER")             # bne INNER
+    out.extend((0xCA,))           # dex
+    BR(0x10, "OFACE")             # bpl OFACE
+    out.extend((0xA2, 0x1F))      # ldx #$1F (copy 32B base -> $03D0)
+    L("COPY")
+    out.extend((0xBD, BASE & 0xFF, BASE >> 8))  # lda BASE,x
+    out.extend((0x9D, 0xD0, 0x03))  # sta $03D0,x
+    out.extend((0xCA,))           # dex
+    BR(0x10, "COPY")              # bpl COPY
+    out.extend((0xA6, MM1_CURSOR_VAR))  # ldx CurrentStage
+    out.extend((0xEC, 0x43, 0xFF))  # cpx $FF43 (top-buster boss?)
+    BR(0xF0, "GREEN")             # beq GREEN
+    out.extend((0x8A,))           # txa
+    out.extend((0x0A,))           # asl a (boss*2: pair index; carry clear)
+    out.extend((0xAA,))           # tax
+    out.extend((0xBD, WCOL & 0xFF, WCOL >> 8))  # lda WCOL,x (light)
+    out.extend((0x8D, 0xE5, 0x03))  # sta $03E5 (sprite slot 1, byte 1)
+    out.extend((0x8D, 0xE7, 0x03))  # sta $03E7 (byte 3 = light, doors conv.)
+    out.extend((0xBD, (WCOL + 1) & 0xFF, (WCOL + 1) >> 8))  # lda WCOL+1,x
+    out.extend((0x8D, 0xE6, 0x03))  # sta $03E6 (byte 2 = dark)
+    out.extend((0x4C, 0, 0))      # jmp GUTSCHK (patched below)
+    fix.append((len(out) - 2, "GUTSCHK", "abs"))
+    L("GREEN")
+    out.extend((0xA9, MM1_HOOK_GREEN))  # lda #green (solid $2A face)
+    out.extend((0x8D, 0xE5, 0x03))  # sta $03E5
+    out.extend((0x8D, 0xE6, 0x03))  # sta $03E6
+    out.extend((0x8D, 0xE7, 0x03))  # sta $03E7
+    L("GUTSCHK")
+    out.extend((0xA5, MM1_CURSOR_VAR))  # lda CurrentStage
+    out.extend((0xC9, 0x05))      # cmp #$05 (Guts?)
+    BR(0xD0, "FLUSH")             # bne FLUSH
+    out.extend((0xA2, 0x02))      # ldx #$02 (mirror slot1 -> BG slot 3)
+    L("GUTS")
+    out.extend((0xBD, 0xE5, 0x03))  # lda $03E5,x
+    out.extend((0x9D, 0xDD, 0x03))  # sta $03DD,x
+    out.extend((0xCA,))           # dex
+    BR(0x10, "GUTS")              # bpl GUTS
+    L("FLUSH")
+    out.extend((0xA9, 0xD0))      # lda #$D0 ($03D0 image lo)
+    out.extend((0x85, 0x3A))      # sta $3A
+    out.extend((0xA9, 0x03))      # lda #$03 (hi)
+    out.extend((0x85, 0x3B))      # sta $3B
+    out.extend((0xA9, 0x20))      # lda #$20 (32 bytes BG+SPR @ $3F00)
+    out.extend((0x85, 0x34))      # sta $34 (WritePaletteParam)
+    out.extend((0xA9, 0x01))      # lda #$01 (flush on next NMI)
+    out.extend((0x85, 0x37))      # sta $37 (PaletteUpdateDelay)
+    L("DONE")
+    out.extend((0x60,))           # rts
+
+    for pos, label, kind in fix:
+        if kind == "abs":
+            tgt = MM1_HOOK_CODE_CPU + at[label]
+            out[pos] = tgt & 0xFF
+            out[pos + 1] = tgt >> 8
+            continue
+        delta = at[label] - (pos + 1)
+        if not -128 <= delta <= 127:
+            raise RandomizerError(
+                f"cursor hook branch {label} out of range ({delta})")
+        out[pos] = delta & 0xFF
+    assert len(out) <= MM1_HOOK_CODE_LEN, (
+        f"cursor hook code {len(out)}B exceeds {MM1_HOOK_CODE_LEN}B")
+    return bytes(out)
+
+
+def _cursor_hook_weakness_colors(charts: List[List[int]]) -> bytes:
+    """Per-boss (light, dark) weakness triple source: the damage-table
+    argmax weapon's robot master colors (doors convention); Buster/Magnet
+    (no robot master, e.g. victory-lap flats) fall back to the boss's own
+    colors. Returns 12 bytes (6 pairs)."""
+    from .wily import ROBOT_MASTER_COLORS, WEAPON_TO_ROBOT_MASTER
+    pairs = []
+    for b, chart in enumerate(charts):
+        w = chart.index(max(chart))
+        rm = WEAPON_TO_ROBOT_MASTER.get(w, b)
+        light, dark = ROBOT_MASTER_COLORS[rm]
+        pairs.extend((light, dark))
+    return bytes(pairs)
+
+
+def _cursor_hook_data(prg: bytes, charts: List[List[int]]) -> bytes:
+    """Build the 54-byte data cave: 32B palette base image (post-patch
+    L1BDAB) + 12B weakness pairs + 5B OAM bases + 5B vanilla slots."""
+    base = bytes(prg[MM1_STAGESEL_PAL:MM1_STAGESEL_PAL + 32])
+    data = (base + _cursor_hook_weakness_colors(charts)
+            + bytes(MM1_HOOK_FACE_BASES) + bytes(MM1_HOOK_FACE_SLOTS))
+    assert len(data) == 54 <= MM1_HOOK_DATA_LEN
+    return data
+
+
+def apply_cursor_hook(prg: bytearray, charts: List[List[int]]) -> None:
+    """Install the cursor-driven stage-select tint hook (fresh install).
+
+    Replaces the F1BB02 tail (STA $1C; RTS) with JSR $FF44 and writes the
+    hook code + data caves. Requires the visualizer (reads the $FF43
+    top-buster index written by :func:`apply_green_top_buster`, and the
+    base image carries the visualizer's BG tint); raises
+    :class:`RandomizerError` on a dirty/missing site. Mirrored in C
+    (``mm1_apply_cursor_hook`` in src/proxy/mm1_rando.h) for byte parity.
+    """
+    if prg[MM1_HOOK_JSR_SITE:MM1_HOOK_JSR_SITE + 3] != MM1_HOOK_JSR_BYTES:
+        raise RandomizerError(
+            "F1BB02 tail missing at 0x1BB47; cursor hook needs it")
+    if any(prg[MM1_HOOK_CODE:MM1_HOOK_CODE + MM1_HOOK_CODE_LEN]):
+        raise RandomizerError("hook code cave 0x1FF44 not zero; refusing")
+    if any(prg[MM1_HOOK_DATA:MM1_HOOK_DATA + MM1_HOOK_DATA_LEN]):
+        raise RandomizerError("hook data cave 0x1FCC7 not zero; refusing")
+    code = _cursor_hook_code()
+    prg[MM1_HOOK_JSR_SITE:MM1_HOOK_JSR_SITE + 3] = bytes(
+        [0x4C, MM1_HOOK_CODE_CPU & 0xFF, MM1_HOOK_CODE_CPU >> 8])
+    prg[MM1_HOOK_CODE:MM1_HOOK_CODE + len(code)] = code
+    data = _cursor_hook_data(prg, charts)
+    prg[MM1_HOOK_DATA:MM1_HOOK_DATA + len(data)] = data
+
+
+def refresh_cursor_hook(prg: bytearray) -> None:
+    """Recompute the hook's data cave from the CURRENT damage charts.
+
+    Needed when an offline patch rewrites the charts after install (victory
+    lap maxes rows 0-5); also refreshes the $FF43 top-buster index the hook
+    reads at runtime. No-op data rewrite when charts are unchanged. Raises
+    :class:`RandomizerError` when the hook is not installed.
+    """
+    if (prg[MM1_HOOK_JSR_SITE:MM1_HOOK_JSR_SITE + 3]
+            != bytes([0x4C, MM1_HOOK_CODE_CPU & 0xFF,
+                      MM1_HOOK_CODE_CPU >> 8])):
+        raise RandomizerError("cursor hook not installed; cannot refresh")
+    charts = _read_charts(prg)
+    top = max(range(6), key=lambda b: charts[b][0])
+    prg[MM1_GREEN_BOSS] = top
+    data = _cursor_hook_data(prg, charts)
+    prg[MM1_HOOK_DATA:MM1_HOOK_DATA + len(data)] = data
+
+
 def _shuffle_weakness(prg: bytearray, rng: "_Rng") -> List[List[int]]:
     charts = _read_charts(prg)
     for i in range(5, 0, -1):
@@ -199,8 +491,49 @@ def _shuffle_weakness(prg: bytearray, rng: "_Rng") -> List[List[int]]:
             j = MM1_THROWABLE[rng.below(3)]
             charts[i], charts[j] = charts[j], charts[i]
             break
+    _flatten_buster(charts)
     _write_charts(prg, charts)
+    # Wily rows (6-10) get their own shuffle so Wily bosses aren't stuck on
+    # vanilla damage (the all-zero CWU-01P row stays fixed).
+    _shuffle_wily(prg, rng)
     return charts
+
+
+# Wily damage rows: 5 rows starting at MM1_DAMAGE_TABLE + 6*8. The rows are
+# Yellow Devil, Copy Robot/refights, CWU-01P (all zero), Wily Machine, and the
+# transient weapon-get screen. We shuffle all but the all-zero CWU row (so no
+# Wily boss can end up immune to everything).
+MM1_WILY_ROWS_BASE = MM1_DAMAGE_TABLE + 6 * 8
+MM1_WILY_SHUFFLE_IDX = [0, 1, 3, 4]
+
+
+def _flatten_buster(charts: List[List[int]]) -> None:
+    """Buster standard: the boss weak to Guts Man's weapon (Super Arm, index
+    6) keeps Cut Man's elevated Buster (3); every other boss drops to 1.
+
+    This makes the stage-select green marker (which follows the highest
+    column-0 damage) always point at the Guts-weak "beginner" boss, and stops
+    Buster from being broadly strong. Called after the row shuffle.
+    """
+    guts = next((b for b, ch in enumerate(charts) if ch[6] == 14), None)
+    if guts is None:
+        guts = next((b for b, ch in enumerate(charts)
+                     if ch.index(max(ch)) == 6), None)
+    for b, ch in enumerate(charts):
+        ch[0] = 3 if b == guts else 1
+
+
+def _shuffle_wily(prg: bytearray, rng: "_Rng") -> None:
+    """Fisher-Yates the Wily rows among themselves (see MM1_WILY_SHUFFLE_IDX)."""
+    base = MM1_WILY_ROWS_BASE
+    idx = MM1_WILY_SHUFFLE_IDX
+    rows = [list(prg[base + i * 8:base + i * 8 + 8]) for i in idx]
+    order = list(range(len(idx)))
+    for i in range(len(order) - 1, 0, -1):
+        j = rng.below(i + 1)
+        order[i], order[j] = order[j], order[i]
+    for dst, src in zip(idx, order):
+        prg[base + dst * 8:base + dst * 8 + 8] = bytes(rows[src])
 
 
 def _shuffle_rewards(
@@ -267,8 +600,16 @@ def randomize_mm1(
     weapons: bool = True,
     visualizer: bool = False,
     palette: bool = True,
+    cursor_tint: bool = False,
 ) -> Spoiler:
-    """Randomize an MM1 PRG in place; return the spoiler."""
+    """Randomize an MM1 PRG in place; return the spoiler.
+
+    ``cursor_tint`` installs the cursor-driven stage-select tint hook
+    (:func:`apply_cursor_hook`); it is implied by ``visualizer`` (kept for
+    backward compatibility -- the hook originally shipped with it) and can
+    also be enabled on its own for a hook without the visualizer IPS
+    (vanilla stage-select background, no Guts-blank side effect).
+    """
     if len(prg) != MM1_PRG_SIZE:
         raise RandomizerError(
             f"MM1 PRG must be {MM1_PRG_SIZE:#x} bytes, got {len(prg):#x}"
@@ -283,7 +624,17 @@ def randomize_mm1(
     if visualizer:
         apply_visualizer(prg)
         for i, chart in enumerate(charts):
-            prg[MM1_WEAKNESS_TABLE + i] = WEAKNESS_VALUE[_argmax(chart)]
+            # P/M (indices 0/7) have no weakness value; 0x00 renders the
+            # visualizer default (matches the C table's 0x00 entries).
+            prg[MM1_WEAKNESS_TABLE + i] = WEAKNESS_VALUE.get(_argmax(chart), 0x00)
+        apply_green_top_buster(prg, charts)
+    if visualizer or cursor_tint:
+        if not visualizer:
+            # Hook-only: no visualizer routine to trampoline, but the hook
+            # still reads the $FF43 top-buster index at runtime, so record
+            # it. Base image is the vanilla L1BDAB (no viz tint present).
+            prg[MM1_GREEN_BOSS] = max(range(6), key=lambda b: charts[b][0])
+        apply_cursor_hook(prg, charts)
     if weapons:
         table = _shuffle_rewards(prg, charts, rng, visualizer=visualizer)
         for i, reward in enumerate(table):
